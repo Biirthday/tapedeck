@@ -40,7 +40,8 @@ same time keep the graph at their rate):
 
 Check tools: `cargo run --release --example verify_decode -- FILE...` compares
 decoded PCM with ffmpeg; `--example verify_output -- FILE...` plays silently and
-prints the format the sound server receives. Covers come from
+prints the format the sound server receives. `TAPEDECK_PROFILE=1` prints the
+average time each stage of a frame takes, and the frame rate. Covers come from
 `folder.jpg`/`cover.jpg` or the art embedded in the first track. Lyrics come
 from `.lrc` files next to each track or from the matching path under
 `1.lyrics` in the music library. Timed lyrics appear karaoke-style in the
@@ -59,7 +60,8 @@ Press `?` for the shortcut sheet.
   pick a track on its J-card (Enter plays it). In the grid all four arrows move
   through albums
 - Click or Enter: load the tape under the cursor. The playing tape leaves the
-  rail for the deck; click its empty gap to return it and stop playback.
+  rail for the deck; click its empty gap (or the deck's EJECT key) to return
+  it and stop playback.
   Home brings the playing tape back into view
 - Middle-click: queue a whole tape from the rail, or one track from the side
   list or a J-card. Queued tracks play before the tape continues; the UP NEXT
@@ -92,6 +94,7 @@ Press `?` for the shortcut sheet.
   track to take it off. Delete twice on a mixtape erases it. Mixtapes live in
   `~/.config/tapedeck/mixtapes.json`
 - F11: toggle fullscreen (remembered for the next start)
+- Deck keys: REW, PLAY (stays down while the tape runs), FF and EJECT
 - Knob: volume; turn it around its center (clockwise raises) or scroll over it.
   Click or drag the progress bar to seek
 

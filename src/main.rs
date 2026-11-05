@@ -100,6 +100,12 @@ const GENRE_PAD: f32 = 6.0;
 /// Grid tracklist panel: header height and row pitch.
 const GRID_CARD_HEAD: f32 = 104.0;
 const GRID_CARD_ROW: f32 = 24.0;
+/// Height of the cassette player in the side column.
+const DECK_H: f32 = 326.0;
+/// Brushed gunmetal of the player's body, its keys, and its LCD.
+const BODY: Color = Color::new(0.215, 0.222, 0.238, 1.0);
+const KEY: Color = Color::new(0.11, 0.115, 0.125, 1.0);
+const LCD: Color = Color::new(0.04, 0.055, 0.05, 1.0);
 /// Deck speaker and volume knob radii; the VU meters take the room between them.
 const GRILLE_R: f32 = 26.0;
 const KNOB_R: f32 = 21.0;
@@ -380,7 +386,8 @@ struct Layout {
     grille: Vec2,
     knob: Vec2,
     slot: Rect,
-    keys: [Rect; 3],
+    /// Piano keys: rewind, play, fast forward, eject.
+    keys: [Rect; 4],
     display: Rect,
     progress: Rect,
     list: Rect,
@@ -395,17 +402,14 @@ impl Layout {
         let frame = Rect::new(SP_S, SP_S, sw - 2.0 * SP_S, sh - 2.0 * SP_S);
         let side = Rect::new(frame.x + SP_M, frame.y + SP_M, 300.0, frame.h - 2.0 * SP_M);
         let stage = Rect::new(side.right() + SP_M, frame.y + SP_M, frame.right() - side.right() - 2.0 * SP_M, frame.h - 2.0 * SP_M);
-        let deck = Rect::new(side.x, side.bottom() - 242.0, side.w, 242.0);
-        let slot = Rect::new(deck.x + SP_M, deck.y + 88.0, deck.w - 2.0 * SP_M, 64.0);
-        let row = slot.bottom() + SP_L;
-        // Play/pause is the widest key; previous and next flank it.
-        let key_x = deck.x + SP_M;
-        let keys = [
-            Rect::new(key_x, row, 28.0, 50.0),
-            Rect::new(key_x + 31.0, row, 40.0, 50.0),
-            Rect::new(key_x + 74.0, row, 28.0, 50.0),
-        ];
-        let display = Rect::new(keys[2].right() + SP_S, row, deck.right() - SP_M - keys[2].right() - SP_S, 50.0);
+        // A cassette player: speaker and meters on top, the cassette door,
+        // an LCD readout, and a row of piano keys along the bottom.
+        let deck = Rect::new(side.x, side.bottom() - DECK_H, side.w, DECK_H);
+        let slot = Rect::new(deck.x + SP_M, deck.y + 88.0, deck.w - 2.0 * SP_M, 100.0);
+        let display = Rect::new(deck.x + SP_M, slot.bottom() + 12.0, deck.w - 2.0 * SP_M, 50.0);
+        let key_w = (deck.w - 2.0 * SP_M - 3.0 * 4.0) / 4.0;
+        let key_y = display.bottom() + 18.0;
+        let keys = [0.0, 1.0, 2.0, 3.0].map(|k| Rect::new(deck.x + SP_M + k * (key_w + 4.0), key_y, key_w, 42.0));
         let progress = Rect::new(display.x + SP_S, display.y + 20.0, display.w - 2.0 * SP_S, 3.0);
         let list_top = side.y + SP_S + if recording { SP_L } else { 0.0 };
         let list_bottom = deck.y - SP_L - if has_queue { SP_L } else { 0.0 };
@@ -610,6 +614,14 @@ struct App {
     reels: (f32, f32),
     /// Reel speed, 0..1: the motor spins up on play and runs down on pause.
     reel_speed: f32,
+    /// Something on screen is still easing towards where it is going.
+    settling: bool,
+    /// Last time the mouse, wheel or keyboard was used, and where the mouse
+    /// was on the previous frame; drives the frame rate.
+    active_at: f64,
+    frame_mouse: Vec2,
+    /// Where the accent color is heading.
+    accent_goal: Color,
     /// Fast wind after a seek or skip: signed reel speed boost, decaying to 0.
     reel_rush: f32,
     /// When the volume last changed; the deck display shows it for a moment.
@@ -652,7 +664,7 @@ struct App {
     edge: Texture2D,
     /// VU needle positions, 0..1 across the dial (0.87 is 0 VU).
     vu: (f32, f32),
-    pressed: [f64; 3],
+    pressed: [f64; 4],
     saved_at: f64,
     dirty_state: bool,
 }
@@ -757,6 +769,10 @@ impl App {
             slot_in: 0.0,
             reels: (0.0, 0.0),
             reel_speed: 0.0,
+            settling: true,
+            active_at: 0.0,
+            frame_mouse: Vec2::ZERO,
+            accent_goal: INK,
             reel_rush: 0.0,
             volume_at: f64::MIN,
             // The tape in front starts out selected, as it was left.
@@ -786,7 +802,7 @@ impl App {
             .map_err(|e| eprintln!("[tapedeck] present shader: {e}"))
             .ok(),
             vu: (0.0, 0.0),
-            pressed: [-1.0; 3],
+            pressed: [-1.0; 4],
             saved_at: 0.0,
             dirty_state: false,
             albums,
@@ -1710,6 +1726,11 @@ impl App {
         let (wx, wy) = mouse_wheel();
         let wheel = if wy != 0.0 { wy } else { wx };
         let wheel = wheel.signum() * wheel.abs().min(3.0);
+        let buttons = [MouseButton::Left, MouseButton::Right, MouseButton::Middle];
+        if mouse != self.frame_mouse || wheel != 0.0 || !get_keys_down().is_empty() || buttons.iter().any(|&b| is_mouse_button_down(b)) {
+            self.active_at = get_time();
+        }
+        self.frame_mouse = mouse;
 
         let grid = self.grid(lay);
         // A resize changes columns and row height: keep the same album at
@@ -2021,6 +2042,8 @@ impl App {
                 self.press(1);
             } else if lay.keys[2].contains(mouse) {
                 self.press(2);
+            } else if lay.keys[3].contains(mouse) {
+                self.press(3);
             } else if lay.slot.contains(mouse) {
                 if let Some(i) = self.current {
                     self.scroll_to(i as f32 - 1.0);
@@ -2213,6 +2236,32 @@ impl App {
         self.last_position = pos;
         if loaded {
             self.desktop.playback(self.audio.is_playing(), Duration::from_secs_f32(pos), jumped);
+        }
+    }
+
+    /// Seconds to wait between frames. Full speed while anything is being
+    /// used or is moving; a running tape only needs its reels, meters and
+    /// lyrics kept smooth; a still deck can idle.
+    fn frame_budget(&self) -> f32 {
+        let now = get_time();
+        let recent = |at: f64, span: f64| now - at < span;
+        let busy = recent(self.active_at, 1.5)
+            || self.settling
+            || recent(self.lyric_change.1, 0.5)
+            || recent(self.volume_at, 1.5)
+            || recent(self.backdrop.2, 1.3)
+            || self.toast.as_ref().is_some_and(|(_, at)| recent(*at, 2.7))
+            || self.seek_drag.is_some()
+            || self.knob_drag.is_some()
+            || self.rescan.is_some()
+            || self.visible().any(|i| self.tapes[i].dirty)
+            || (self.accent.r - self.accent_goal.r).abs() + (self.accent.g - self.accent_goal.g).abs() + (self.accent.b - self.accent_goal.b).abs() > 0.01;
+        if busy {
+            0.0
+        } else if self.audio.is_playing() {
+            1.0 / 30.0
+        } else {
+            1.0 / 12.0
         }
     }
 
@@ -2468,9 +2517,14 @@ impl App {
                 self.prev()
             }
             1 => self.toggle(),
-            _ => {
+            2 => {
                 self.reel_rush = 1.0;
                 self.next()
+            }
+            _ => {
+                if self.current.is_some() {
+                    self.return_tape();
+                }
             }
         }
     }
@@ -2552,6 +2606,7 @@ impl App {
         }
         let searching = !self.query.is_empty();
         let focused_idx = if searching { self.matches.get(self.focus).map(|m| m.0) } else { None };
+        let mut moving = false;
         for (i, tape) in self.tapes.iter_mut().enumerate() {
             let matched = searching && tape.matched;
             let goal = if Some(i) == self.hover || focused_idx == Some(i) {
@@ -2568,6 +2623,7 @@ impl App {
             }
             let out = if self.current == Some(i) { 1.0 } else { 0.0 };
             let flip = if self.flipped == Some(i) { 1.0 } else { 0.0 };
+            moving |= (tape.lift - goal).abs() > 0.002 || (tape.dim - dim).abs() > 0.002 || tape.out != out || tape.flip != flip;
             // Linear in time, like the flip: tape_matrix shapes it into the
             // pull, the presentation and the flight to the deck.
             let step = dt / LOAD_TIME;
@@ -2576,6 +2632,12 @@ impl App {
             let step = dt / FLIP_TIME;
             tape.flip = if flip > tape.flip { (tape.flip + step).min(flip) } else { (tape.flip - step).max(flip) };
         }
+        self.settling = moving
+            || self.scroll != self.target
+            || self.grid_scroll != self.grid_target
+            || self.slot_in < 1.0
+            || self.reel_rush != 0.0
+            || (0.01..0.99).contains(&self.reel_speed);
         // The deck takes the tape once it has flown off the stage towards it.
         if self.current.is_some_and(|i| self.view == View::Grid || self.tapes[i].out > 0.85) {
             self.slot_in = (self.slot_in + dt * 2.2).min(1.0);
@@ -2603,6 +2665,7 @@ impl App {
         let ease = 1.0 - (-dt * 4.0).exp();
         let mix = |a: f32, b: f32| a + (b - a) * ease;
         self.accent = Color::new(mix(self.accent.r, goal.r), mix(self.accent.g, goal.g), mix(self.accent.b, goal.b), 1.0);
+        self.accent_goal = goal;
         if let Some(Lyrics::Synced(lines)) = &self.lyrics {
             let focus = self.lyric_focus(lines, self.audio.position().as_secs_f32() + 0.2);
             if focus != self.lyric_change.0 {
@@ -3805,6 +3868,35 @@ impl App {
         rows
     }
 
+    /// The tape seen through the cassette door: shell, paper label with the
+    /// side and title, the cover behind the window, and the reels winding.
+    fn draw_deck_cassette(&self, mini: Rect, i: usize) {
+        let (tape, album, f) = (&self.tapes[i], &self.albums[i], &self.fonts);
+        round_rect(mini, R_BOX, tape.shell);
+        round_rect_lines(mini, R_BOX, 1.0, Color::new(1.0, 1.0, 1.0, 0.25));
+        let label = Rect::new(mini.x + 6.0, mini.y + 5.0, mini.w - 12.0, mini.h - 16.0);
+        if let Some(tex) = &tape.cover {
+            cover_fit(tex, label, 0.4, WHITE);
+        } else {
+            draw_rectangle(label.x, label.y, label.w, label.h, Color::from_rgba(236, 231, 216, 255));
+        }
+        // Paper strip with the side and the album, as on the tapes' labels.
+        let strip = Rect::new(label.x, label.y, label.w, 15.0);
+        draw_rectangle(strip.x, strip.y, strip.w, strip.h, Color::from_rgba(236, 231, 216, 255));
+        let ink = Color::from_rgba(28, 34, 70, 255);
+        draw_rectangle_lines(strip.x + 3.0, strip.y + 2.0, 11.0, 11.0, 1.0, ink);
+        f.draw("A", strip.x + 5.5, strip.y + 11.0, 9.0, ink, true);
+        f.draw(&f.fit(&album.album.to_uppercase(), 9.0, true, strip.w - 24.0), strip.x + 19.0, strip.y + 11.0, 9.0, ink, true);
+        let win = Rect::new(mini.x + mini.w * 0.2, label.y + strip.h + (label.h - strip.h - gfx::DECK_WINDOW_H) / 2.0, mini.w * 0.6, gfx::DECK_WINDOW_H);
+        gfx::winding_window(win, self.progress(), self.reels);
+        for (x, y) in [(mini.x + 4.0, mini.y + 4.0), (mini.right() - 4.0, mini.y + 4.0), (mini.x + 4.0, mini.bottom() - 4.0), (mini.right() - 4.0, mini.bottom() - 4.0)] {
+            draw_circle(x, y, 1.8, Color::from_rgba(150, 152, 156, 255));
+        }
+        // The head opening along the bottom edge.
+        let foot = Rect::new(mini.x + mini.w * 0.25, mini.bottom() - 9.0, mini.w * 0.5, 9.0);
+        draw_rectangle(foot.x, foot.y, foot.w, foot.h, Color::from_rgba(8, 8, 9, 255));
+    }
+
     /// Analog VU meter: cream dial, scale with a red zone, black needle.
     fn draw_vu(&self, r: Rect, value: f32, channel: &str) {
         let f = &self.fonts;
@@ -3841,21 +3933,35 @@ impl App {
     fn draw_deck(&self, lay: &Layout) {
         let d = lay.deck;
         let f = &self.fonts;
-        round_rect_lines(d, R_PANEL, 1.5, LINE);
-        let tab = Rect::new(d.center().x - 17.0, d.y - 12.0, 34.0, 12.0);
-        round_rect(Rect::new(tab.x, tab.y, tab.w, tab.h + 4.0), R_CHIP, INK);
-        f.draw("A", tab.center().x - f.width("A", 10.0, true) / 2.0, tab.y + 10.0, 10.0, BLACK, true);
 
-        // Speaker grille, breathing with the music.
-        let g = lay.grille;
-        let r = GRILLE_R * (1.0 + self.level * 0.08);
-        let mut y = -r + 1.0;
-        while y < r {
-            let half = (r * r - y * y).max(0.0).sqrt();
-            draw_rectangle(g.x - half, g.y + y, half * 2.0, 1.6, INK);
-            y += 4.5;
+        // Body: brushed gunmetal with a lit top edge and a shadowed bottom.
+        round_rect(d, R_PANEL, BODY);
+        let mut y = d.y + 3.0;
+        let mut k = 0;
+        while y < d.bottom() - 3.0 {
+            let a = if k % 2 == 0 { 0.025 } else { 0.0 } + if k % 7 == 0 { 0.02 } else { 0.0 };
+            draw_rectangle(d.x + 4.0, y, d.w - 8.0, 1.0, Color::new(1.0, 1.0, 1.0, a));
+            y += 2.0;
+            k += 1;
         }
-        ring(g.x, g.y, r, 1.5, LINE);
+        draw_rectangle(d.x + R_PANEL, d.y + 1.0, d.w - 2.0 * R_PANEL, 1.0, Color::new(1.0, 1.0, 1.0, 0.25));
+        draw_rectangle(d.x + R_PANEL, d.bottom() - 2.0, d.w - 2.0 * R_PANEL, 1.0, Color::new(0.0, 0.0, 0.0, 0.5));
+        round_rect_lines(d, R_PANEL, 1.5, LINE);
+
+        // Speaker: a perforated square, its holes swelling with the music.
+        let g = lay.grille;
+        let grille = Rect::new(g.x - GRILLE_R, g.y - GRILLE_R, 2.0 * GRILLE_R, 2.0 * GRILLE_R);
+        round_rect(grille, R_BOX, Color::new(0.0, 0.0, 0.0, 0.35));
+        round_rect_lines(grille, R_BOX, 1.0, Color::new(1.0, 1.0, 1.0, 0.18));
+        let hole = 1.5 + self.level * 0.6;
+        let step = 6.5;
+        let n = ((grille.w - 8.0) / step).floor() as i32;
+        let pad = (grille.w - (n - 1) as f32 * step) / 2.0;
+        for row in 0..n {
+            for col in 0..n {
+                draw_circle(grille.x + pad + col as f32 * step, grille.y + pad + row as f32 * step, hole, Color::new(0.0, 0.0, 0.0, 0.85));
+            }
+        }
 
         // Stereo VU meters between the speaker and the knob.
         let left_edge = lay.grille.x + GRILLE_R + SP_S;
@@ -3875,6 +3981,7 @@ impl App {
         let angle_of = |v: f32| (-135.0 + v * 270.0).to_radians() - FRAC_PI_2;
         let sweep = 1.5 * PI;
         let rad = KNOB_R - 3.0;
+        draw_circle(k.x, k.y, rad - 4.0, Color::new(0.0, 0.0, 0.0, 0.3));
         gfx::arc(k.x, k.y, rad, angle_of(0.0), sweep, 3.0, Color::new(1.0, 1.0, 1.0, 0.22));
         gfx::arc(k.x, k.y, rad, angle_of(0.0), sweep * self.volume, 3.0, INK);
         // Stops at both ends of the travel.
@@ -3890,40 +3997,43 @@ impl App {
         let level = format!("{}", (self.volume * 100.0).round() as u32);
         f.draw(&level, k.x - f.width(&level, 11.0, true) / 2.0, k.y + 4.0, 11.0, INK, true);
 
-        // Tape slot.
+        // Cassette door: a recessed compartment behind smoked glass.
         let s = lay.slot;
-        let mut x = s.x - s.h;
-        while x < s.right() {
-            let x0 = x.max(s.x);
-            let x1 = (x + s.h).min(s.right());
-            draw_line(x0, s.bottom() - (x0 - x), x1, s.bottom() - (x1 - x), 1.0, Color::new(1.0, 1.0, 1.0, 0.18));
-            x += 7.0;
-        }
+        round_rect(Rect::new(s.x - 2.0, s.y - 2.0, s.w + 4.0, s.h + 4.0), R_BOX + 2.0, Color::new(0.0, 0.0, 0.0, 0.45));
+        round_rect(s, R_BOX, Color::from_rgba(14, 15, 17, 255));
+        let bay = Rect::new(s.x + 10.0, s.y + 8.0, s.w - 20.0, s.h - 26.0);
+        let mut gl = unsafe { get_internal_gl() };
+        gl.flush();
+        gl.quad_gl.scissor(Some((bay.x as i32, bay.y as i32, bay.w as i32, bay.h as i32)));
         match self.current {
             None => {
+                // An empty bay: the two drive spindles and a hint.
+                for x in [bay.x + bay.w * 0.3, bay.right() - bay.w * 0.3] {
+                    gfx::reel(x, bay.center().y, 7.0, 0.0, Color::from_rgba(14, 15, 17, 255));
+                }
                 let t = "CHOOSE A TAPE";
-                let w = f.width(t, 10.0, false);
-                draw_rectangle(s.center().x - w / 2.0 - 6.0, s.center().y - 8.0, w + 12.0, 16.0, BLACK);
-                f.draw(t, s.center().x - w / 2.0, s.center().y + 4.0, 10.0, INK, false);
+                f.draw(t, bay.center().x - f.width(t, 10.0, false) / 2.0, bay.bottom() - 6.0, 10.0, DIM, false);
             }
             Some(i) => {
+                // The tape drops in from above as the deck takes it.
                 let ease = 1.0 - (1.0 - self.slot_in).powi(3);
-                let mini = Rect::new(s.x + 10.0, s.y + 5.0 + (1.0 - ease) * s.h, s.w - 20.0, s.h - 10.0);
-                let tape = &self.tapes[i];
-                round_rect(mini, R_BOX, tape.shell);
-                round_rect_lines(mini, R_BOX, 1.0, Color::new(1.0, 1.0, 1.0, 0.25));
-                let label = Rect::new(mini.x + 4.0, mini.y + 3.0, mini.w - 8.0, mini.h - 13.0);
-                if let Some(tex) = &tape.cover {
-                    cover_fit(tex, label, 0.4, Color::new(1.0, 1.0, 1.0, 0.9));
-                }
-                let win = Rect::new(mini.x + mini.w * 0.2, mini.center().y - 14.0, mini.w * 0.6, gfx::DECK_WINDOW_H);
-                gfx::winding_window(win, self.progress(), self.reels);
-                // Hide the part of the sliding tape that is still below the slot.
-                draw_rectangle(s.x - 1.0, s.bottom(), s.w + 2.0, mini.h + 8.0, FRAME_BG);
+                let mini = Rect::new(bay.x + 4.0, bay.y + 3.0 - (1.0 - ease) * bay.h, bay.w - 8.0, bay.h - 6.0);
+                self.draw_deck_cassette(mini, i);
             }
         }
-        round_rect_lines(s, R_BOX, 1.5, LINE);
-        // Sticker on the slot's corner while a hi-res track plays.
+        let mut gl = unsafe { get_internal_gl() };
+        gl.flush();
+        gl.quad_gl.scissor(None);
+        // Glass: a little smoke and a diagonal glint, then the frame.
+        draw_rectangle(bay.x, bay.y, bay.w, bay.h, Color::new(0.05, 0.06, 0.07, 0.18));
+        let glint = Color::new(1.0, 1.0, 1.0, 0.07);
+        draw_triangle(vec2(bay.x + bay.w * 0.18, bay.y), vec2(bay.x + bay.w * 0.3, bay.y), vec2(bay.x + bay.w * 0.12, bay.bottom()), glint);
+        draw_triangle(vec2(bay.x + bay.w * 0.12, bay.bottom()), vec2(bay.x + bay.w * 0.3, bay.y), vec2(bay.x + bay.w * 0.24, bay.bottom()), glint);
+        round_rect_lines(bay, 3.0, 1.0, Color::new(1.0, 1.0, 1.0, 0.16));
+        round_rect_lines(s, R_BOX, 1.0, Color::new(1.0, 1.0, 1.0, 0.22));
+        let print = "AUTO STOP  ·  NORMAL BIAS  120µs EQ";
+        f.draw(print, s.x + 12.0, s.bottom() - 6.0, 8.0, Color::new(1.0, 1.0, 1.0, 0.4), false);
+        // Sticker on the door's corner while a hi-res track plays.
         if let Some(i) = self.current
             && self.albums[i].tracks.get(self.track).is_some_and(|t| t.hires)
         {
@@ -3932,42 +4042,62 @@ impl App {
             round_rect(tag, R_CHIP, self.accent);
             f.draw("HI-RES", tag.x + 6.0, tag.y + 10.5, 9.0, BLACK, true);
         }
-        draw_rectangle(d.x, s.bottom() + 12.0, d.w, 1.5, LINE);
 
-        // Keys.
+        // Piano keys, labelled on the body above them. Play stays latched
+        // down while the tape runs; the others spring back.
         let now = get_time();
+        let playing = self.audio.is_playing();
         for (k, key) in lay.keys.iter().enumerate() {
-            let down = now - self.pressed[k] < 0.12;
-            let r = Rect::new(key.x, key.y + if down { 2.0 } else { 0.0 }, key.w, key.h);
-            round_rect(r, R_CHIP, INK);
-            let lip = if down { 2.0 } else { 6.0 };
-            draw_rectangle(r.x, r.bottom() - lip, r.w, lip, Color::new(0.0, 0.0, 0.0, 0.12));
-            let c = vec2(r.center().x, r.bottom() - 15.0);
-            // Icon scale: the play key's glyph is the largest.
-            let u = if k == 1 { 1.6 } else { 1.3 };
-            let pt = |x: f32, y: f32| c + vec2(x, y) * u;
+            let name = ["REW", "PLAY", "FF", "EJECT"][k];
+            f.draw(name, key.center().x - f.width(name, 9.0, true) / 2.0, key.y - 6.0, 9.0, Color::new(1.0, 1.0, 1.0, 0.75), true);
+            let latched = k == 1 && playing;
+            let tapped = now - self.pressed[k] < 0.12;
+            let sink = if latched { 5.0 } else if tapped { 3.0 } else { 0.0 };
+            // The slot the key moves in, then the key cap.
+            round_rect(Rect::new(key.x - 1.0, key.y - 1.0, key.w + 2.0, key.h + 2.0), R_CHIP + 1.0, Color::new(0.0, 0.0, 0.0, 0.6));
+            let cap = Rect::new(key.x, key.y + sink, key.w, key.h - sink);
+            let base = if k == 1 { Color { a: 1.0, ..self.accent } } else { KEY };
+            let shade = if latched { 0.8 } else { 1.0 };
+            round_rect(cap, R_CHIP, Color::new(base.r * shade, base.g * shade, base.b * shade, 1.0));
+            // A lit front lip, and three grip dots near the bottom.
+            draw_rectangle(cap.x + 3.0, cap.y + 1.0, cap.w - 6.0, 1.0, Color::new(1.0, 1.0, 1.0, if k == 1 { 0.45 } else { 0.18 }));
+            let dark = if k == 1 { Color::new(0.0, 0.0, 0.0, 0.55) } else { Color::new(1.0, 1.0, 1.0, 0.35) };
+            for dx in [-6.0, 0.0, 6.0] {
+                draw_circle(cap.center().x + dx, cap.bottom() - 8.0, 1.5, dark);
+            }
+            // The key's symbol, small, above the dots.
+            let c = vec2(cap.center().x, cap.y + 14.0);
+            let pt = |x: f32, y: f32| c + vec2(x, y);
             match k {
                 0 => {
                     for dx in [-5.0, 1.0] {
-                        draw_triangle(pt(dx, 0.0), pt(dx + 5.0, -4.0), pt(dx + 5.0, 4.0), BLACK);
+                        draw_triangle(pt(dx, 0.0), pt(dx + 5.0, -4.0), pt(dx + 5.0, 4.0), dark);
                     }
                 }
-                1 if self.audio.is_playing() => {
-                    draw_rectangle(c.x - 4.0 * u, c.y - 4.0 * u, 2.5 * u, 8.0 * u, BLACK);
-                    draw_rectangle(c.x + 1.5 * u, c.y - 4.0 * u, 2.5 * u, 8.0 * u, BLACK);
+                1 if playing => {
+                    draw_rectangle(c.x - 4.0, c.y - 4.0, 2.5, 8.0, dark);
+                    draw_rectangle(c.x + 1.5, c.y - 4.0, 2.5, 8.0, dark);
                 }
-                1 => draw_triangle(pt(-3.0, -4.0), pt(-3.0, 4.0), pt(4.0, 0.0), BLACK),
-                _ => {
+                1 => draw_triangle(pt(-3.0, -4.5), pt(-3.0, 4.5), pt(4.5, 0.0), dark),
+                2 => {
                     for dx in [-5.0, 1.0] {
-                        draw_triangle(pt(dx, -4.0), pt(dx, 4.0), pt(dx + 5.0, 0.0), BLACK);
+                        draw_triangle(pt(dx, -4.0), pt(dx, 4.0), pt(dx + 5.0, 0.0), dark);
                     }
+                }
+                _ => {
+                    draw_triangle(pt(-5.0, 1.0), pt(5.0, 1.0), pt(0.0, -5.0), dark);
+                    draw_rectangle(c.x - 5.0, c.y + 3.0, 10.0, 2.0, dark);
                 }
             }
         }
 
         // Display: track, time, progress, current lyric.
         let dp = lay.display;
-        round_rect_lines(dp, R_BOX, 1.5, LINE);
+        // An LCD set into the body.
+        round_rect(Rect::new(dp.x - 2.0, dp.y - 2.0, dp.w + 4.0, dp.h + 4.0), R_BOX + 2.0, Color::new(0.0, 0.0, 0.0, 0.45));
+        round_rect(dp, R_BOX, LCD);
+        draw_rectangle(dp.x + 4.0, dp.y + 2.0, dp.w - 8.0, 1.0, Color::new(1.0, 1.0, 1.0, 0.06));
+        round_rect_lines(dp, R_BOX, 1.0, Color::new(1.0, 1.0, 1.0, 0.2));
         let dur = self.duration().map(|d| d.as_secs_f32()).filter(|&d| d > 0.0);
         let pos = match (self.seek_drag, dur) {
             (Some(f), Some(d)) => f * d,
@@ -4220,11 +4350,26 @@ async fn main() {
     }
     let mut frames = 0u32;
 
+    // Debug aid: TAPEDECK_PROFILE=1 prints the average time per frame spent
+    // in each stage (CPU side, including the GL calls made there) every 240 frames.
+    let profile = std::env::var("TAPEDECK_PROFILE").is_ok();
+    let mut spent = [0.0f64; 8];
     loop {
+        let frame_start = get_time();
+        let mut clock = std::time::Instant::now();
+        let mut lap = |k: usize| {
+            if profile {
+                spent[k] += clock.elapsed().as_secs_f64();
+                clock = std::time::Instant::now();
+            }
+        };
         app.receive_covers();
         app.input(&app.layout());
+        lap(0);
         app.tick(get_frame_time().min(0.1));
+        lap(1);
         app.render_faces();
+        lap(2);
 
         let lay = app.layout();
         app.ensure_canvas();
@@ -4232,11 +4377,21 @@ async fn main() {
         clear_background(FRAME_BG);
         app.draw_backdrop();
         app.draw_frame(&lay);
+        lap(3);
         app.draw_stage(&lay);
+        lap(4);
         app.draw_side(&lay);
+        lap(5);
         app.present();
+        lap(6);
 
         frames += 1;
+        if profile && frames % 240 == 0 {
+            let names = ["input", "tick", "faces", "frame", "stage", "side", "present", "swap"];
+            let line: Vec<String> = names.iter().zip(spent).map(|(n, t)| format!("{n} {:.2}ms", t * 1000.0 / 240.0)).collect();
+            eprintln!("[profile] {}  ({:.0} fps)", line.join("  "), get_fps());
+            spent = [0.0; 8];
+        }
         if let Some(path) = &shot {
             if frames == 240 {
                 get_screen_data().export_png(path);
@@ -4247,6 +4402,17 @@ async fn main() {
             app.save();
             break;
         }
+        // Idle frames wait instead of redrawing an unchanged deck at the
+        // display's full rate.
+        let budget = app.frame_budget() as f64;
+        let used = get_time() - frame_start;
+        if budget > used {
+            std::thread::sleep(std::time::Duration::from_secs_f64(budget - used));
+        }
+        let swap = std::time::Instant::now();
         next_frame().await;
+        if profile {
+            spent[7] += swap.elapsed().as_secs_f64();
+        }
     }
 }

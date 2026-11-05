@@ -23,6 +23,11 @@ pub struct Fonts {
     regular: Option<Font>,
     bold: Option<Font>,
     cjk: Option<Font>,
+    /// Glyphs known to be in a font's atlas, by font address, character and size.
+    cached: std::cell::RefCell<std::collections::HashSet<(usize, char, u16)>>,
+    /// Measured widths by a hash of text, size and weight: the same labels
+    /// are measured every frame, and measuring walks every glyph.
+    widths: std::cell::RefCell<std::collections::HashMap<u64, f32>>,
 }
 
 fn system_font(pattern: &str) -> Option<Font> {
@@ -39,7 +44,27 @@ impl Fonts {
             bold: system_font("JetBrains Mono:style=Bold").or_else(|| system_font("monospace:bold")),
             // Many titles are Japanese or Korean.
             cjk: system_font("Noto Sans CJK JP:style=Bold"),
+            cached: Default::default(),
+            widths: Default::default(),
         }
+    }
+
+    /// Puts any glyph of `text` that is not cached yet into the font's atlas,
+    /// after drawing what is queued. A new glyph can make the atlas grow,
+    /// which repacks every glyph and replaces its texture: text already
+    /// queued in the frame would then sample the wrong places.
+    fn prepare(&self, font: Option<&Font>, text: &str, size: u16) {
+        let Some(font) = font else { return };
+        let id = font as *const Font as usize;
+        let mut cached = self.cached.borrow_mut();
+        let missing: Vec<char> = text.chars().filter(|&c| !cached.contains(&(id, c, size))).collect();
+        if missing.is_empty() {
+            return;
+        }
+        let mut gl = unsafe { get_internal_gl() };
+        gl.flush();
+        font.populate_font_cache(&missing, size);
+        cached.extend(missing.into_iter().map(|c| (id, c, size)));
     }
 
     fn pick(&self, text: &str, bold: bool) -> Option<&Font> {
@@ -52,12 +77,30 @@ impl Fonts {
     }
 
     pub fn width(&self, text: &str, size: f32, bold: bool) -> f32 {
-        measure_text(text, self.pick(text, bold), size as u16, 1.0).width
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (text, size as u16, bold).hash(&mut h);
+        let key = h.finish();
+        if let Some(&w) = self.widths.borrow().get(&key) {
+            return w;
+        }
+        let font = self.pick(text, bold);
+        self.prepare(font, text, size as u16);
+        let w = measure_text(text, font, size as u16, 1.0).width;
+        let mut widths = self.widths.borrow_mut();
+        // Scrolling titles and search results keep adding new strings.
+        if widths.len() > 20_000 {
+            widths.clear();
+        }
+        widths.insert(key, w);
+        w
     }
 
     /// Draws `text` with its baseline at `y`.
     pub fn draw(&self, text: &str, x: f32, y: f32, size: f32, color: Color, bold: bool) {
-        draw_text_ex(text, x, y, TextParams { font: self.pick(text, bold), font_size: size as u16, color, ..Default::default() });
+        let font = self.pick(text, bold);
+        self.prepare(font, text, size as u16);
+        draw_text_ex(text, x, y, TextParams { font, font_size: size as u16, color, ..Default::default() });
     }
 
     /// Breaks `text` into at most `lines` lines no wider than `max`. Words
@@ -618,7 +661,7 @@ pub fn render_jcard(target: &RenderTarget, fonts: &Fonts, album: &str, artist: &
     // Cache all glyphs before drawing, so atlas growth cannot move queued glyphs.
     let font_scale = 1.0 / JCARD_SCALE;
     for (text, _, _, font_size, _, bold) in &labels {
-        measure_text(text, fonts.pick(text, *bold), *font_size, font_scale);
+        fonts.prepare(fonts.pick(text, *bold), text, *font_size);
     }
     for (text, x, y, font_size, color, bold) in &labels {
         draw_text_ex(text, *x, *y, TextParams {
@@ -684,7 +727,7 @@ pub fn winding_window(win: Rect, progress: f32, angles: (f32, f32)) {
 }
 
 const REEL_HUB: f32 = 5.0;
-pub const DECK_WINDOW_H: f32 = 24.0;
+pub const DECK_WINDOW_H: f32 = 26.0;
 
 /// Radii of the tape packed on the supply and take-up reels. Tape length
 /// goes with pack area, so radii follow a square root.
