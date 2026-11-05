@@ -1,0 +1,10 @@
+{
+  "name": "tapedeck",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cassette-style player for the local music library",
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}

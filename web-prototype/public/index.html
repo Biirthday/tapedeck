@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tapedeck</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Permanent+Marker&display=swap">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="backdrop"><div class="bg" id="bgA"></div><div class="bg" id="bgB"></div></div>
+
+  <main class="frame">
+    <i class="dot tl"></i><i class="dot tr"></i><i class="dot bl"></i><i class="dot br"></i>
+
+    <aside class="side">
+      <header class="brand">
+        <span class="pill">TAPES</span><span class="pill num" id="count">000</span>
+        <p>PERSONAL SELECTION<br>OF ALBUMS FROM<br>THE LOCAL LIBRARY.</p>
+      </header>
+
+      <section class="now" id="now">
+        <div class="now-empty">
+          <h1>WHAT’S PLAYING ?</h1>
+          <p>CLICK TO LOAD THE TAPE</p>
+        </div>
+        <div class="now-full">
+          <h1 id="nowAlbum"></h1>
+          <p id="nowArtist"></p>
+          <ol class="tracks" id="tracks"></ol>
+        </div>
+      </section>
+
+      <section class="deck">
+        <span class="deck-tab">A</span>
+        <div class="deck-top">
+          <div class="grille" id="grille"></div>
+          <div class="knob-wrap" title="Volume (drag or scroll)">
+            <div class="knob" id="knob"><i></i></div>
+            <span class="knob-dot"></span>
+          </div>
+        </div>
+        <div class="slot" id="slot">
+          <span class="slot-hint">CHOOSE A TAPE</span>
+          <div class="mini" id="mini">
+            <div class="mini-label" id="miniLabel"></div>
+            <div class="mini-window"><i class="reel"></i><i class="reel"></i></div>
+          </div>
+        </div>
+        <div class="deck-bottom">
+          <div class="keys">
+            <button class="key" id="prev" aria-label="Previous"><svg viewBox="0 0 12 8"><path d="M6 0v8L0 4zM12 0v8L6 4z"/></svg></button>
+            <button class="key" id="play" aria-label="Play"><svg class="i-play" viewBox="0 0 12 8"><path d="M3 0v8l7-4z"/></svg><svg class="i-pause" viewBox="0 0 12 8"><path d="M2.5 0h2.5v8H2.5zM7 0h2.5v8H7z"/></svg></button>
+            <button class="key" id="next" aria-label="Next"><svg viewBox="0 0 12 8"><path d="M0 0v8l6-4zM6 0v8l6-4z"/></svg></button>
+          </div>
+          <div class="display" id="display">
+            <div class="disp-row"><span id="dTrack">--</span><span id="dTime">00:00</span></div>
+            <div class="progress" id="progress"><i id="progressBar"></i></div>
+            <div class="lyric" id="lyric"></div>
+          </div>
+        </div>
+      </section>
+    </aside>
+
+    <section class="stage" id="stage">
+      <i class="tick t"></i><i class="tick b"></i><i class="tick l"></i><i class="tick r"></i>
+      <div class="stage-info">
+        <strong id="hoverTitle">&nbsp;</strong>
+        <span id="hoverArtist">&nbsp;</span>
+      </div>
+      <div class="rail" id="rail"></div>
+      <div class="stage-hint" id="hint">CLICK TO LISTEN.</div>
+      <div class="stage-count"><span id="pos">001</span> / <span id="total">000</span>
+        <svg viewBox="0 0 34 22" aria-hidden="true"><rect x="1" y="1" width="32" height="20" rx="2"/><rect x="7" y="6" width="20" height="7" rx="3.5"/><circle cx="11" cy="9.5" r="2"/><circle cx="23" cy="9.5" r="2"/><path d="M8 21l3-4h12l3 4"/></svg>
+      </div>
+    </section>
+  </main>
+
+  <audio id="audio" preload="auto"></audio>
+  <script src="app.js" type="module"></script>
+</body>
+</html>
