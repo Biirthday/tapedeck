@@ -652,6 +652,12 @@ struct App {
     lyrics_scroll: f32,
     lyric_preview: Option<f32>,
     list_scroll: f32,
+    /// The side list's cover is turned to show the album's details.
+    sleeve_back: bool,
+    /// How far the cover has turned, 0 (front) to 1 (back).
+    sleeve_turn: f32,
+    /// First row shown on the cover's back.
+    sleeve_scroll: usize,
     volume: f32,
     drag: Option<(f32, f32, bool)>,
     /// Mouse angle around the volume knob on the previous frame, while turning it.
@@ -713,6 +719,8 @@ struct App {
     jcard: Option<(usize, usize, RenderTarget)>,
     /// The deck's still parts, painted for the deck rectangle they fit.
     deck_cache: std::cell::RefCell<Option<(Rect, RenderTarget)>>,
+    /// Both sides of the side list's cover, painted while it turns.
+    sleeve_faces: std::cell::RefCell<Option<(Vec2, RenderTarget, RenderTarget)>>,
     level: f32,
     /// Multisampled canvas the whole frame is drawn into, then copied to the
     /// window: smooth edges without relying on the window's own MSAA.
@@ -827,6 +835,9 @@ impl App {
             lyrics_scroll: 0.0,
             lyric_preview: None,
             list_scroll: 0.0,
+            sleeve_back: false,
+            sleeve_turn: 0.0,
+            sleeve_scroll: 0,
             volume: saved.volume.unwrap_or(0.8),
             drag: None,
             knob_drag: None,
@@ -862,6 +873,7 @@ impl App {
             jcard_page: 0,
             jcard: None,
             deck_cache: Default::default(),
+            sleeve_faces: Default::default(),
             level: 0.0,
             canvas: None,
             edge: edge_texture(),
@@ -1320,6 +1332,9 @@ impl App {
         if self.current != Some(i) {
             self.slot_in = 0.0;
             self.list_scroll = 0.0;
+            self.sleeve_back = false;
+            self.sleeve_turn = 0.0;
+            self.sleeve_scroll = 0;
         }
         if self.flipped == Some(i) {
             self.flipped = None;
@@ -2070,12 +2085,23 @@ impl App {
         } else if let Some(i) = self.current {
             let len = self.albums[i].tracks.len() as f32;
             let rows = lay.list_rows() as f32;
-            if wheel != 0.0 && lay.list.contains(mouse) {
+            let shown = lay.list_rows().min(self.albums[i].tracks.len());
+            let sleeve = self.sleeve_layout(lay.list, i, shown).map(|(art, _)| art).filter(|art| art.contains(mouse));
+            let on_sleeve = sleeve.is_some();
+            if let (Some(art), true, true) = (sleeve, wheel != 0.0, self.sleeve_back) {
+                let max = self.sleeve_back_rows(art, i).2 as f32;
+                self.sleeve_scroll = (self.sleeve_scroll as f32 - wheel.signum()).clamp(0.0, max) as usize;
+            } else if wheel != 0.0 && lay.list.contains(mouse) {
                 self.list_scroll = (self.list_scroll - wheel).clamp(0.0, (len - rows).max(0.0)).round();
             }
             if is_mouse_button_pressed(MouseButton::Left) {
                 if let Some(n) = self.track_at(lay, mouse) {
                     self.play_track(n, true, 0.0);
+                }
+                // Clicking the cover turns it over.
+                if on_sleeve {
+                    self.sleeve_back = !self.sleeve_back;
+                    self.sleeve_scroll = 0;
                 }
                 // Clicking a mixtape's title names it.
                 if let Some(id) = self.albums[i].mix {
@@ -2736,6 +2762,8 @@ impl App {
         if (self.target - self.scroll).abs() < 0.0005 {
             self.scroll = self.target;
         }
+        let goal = if self.sleeve_back { 1.0 } else { 0.0 };
+        self.sleeve_turn += (goal - self.sleeve_turn).clamp(-dt * 3.0, dt * 3.0);
         let k = 1.0 - (-dt * 12.0).exp();
         let vis = self.visible();
         if self.flipped.is_some_and(|f| !vis.contains(&f)) {
@@ -4341,36 +4369,34 @@ impl App {
         }
     }
 
-    /// Fills the space a short tracklist leaves with the cover and a summary
-    /// line (tracks, running time, genre).
-    fn draw_sleeve(&self, l: Rect, i: usize, rows: usize) {
-        let a = &self.albums[i];
-        let chips = self.genre_chips(&a.genre, l.w - 8.0);
+    /// Where the side list's cover sits, and the genre chips laid out under
+    /// it; None when the tracklist leaves no room for them.
+    fn sleeve_layout(&self, l: Rect, i: usize, rows: usize) -> Option<(Rect, Vec<Vec<(String, f32)>>)> {
+        let chips = self.genre_chips(&self.albums[i].genre, l.w - 8.0);
         // Below the cover: the summary line, then up to two rows of genre chips.
         let below = 26.0 + chips.len() as f32 * GENRE_ROW;
         let free = l.h - 50.0 - rows as f32 * 22.0 - (below - 26.0);
         if free < 150.0 {
-            return;
+            return None;
         }
-        let covers = match a.mix {
-            Some(_) => self.mix_covers(i),
-            None => self.tapes[i].cover.iter().cloned().collect(),
-        };
         let size = (free - 52.0).min(l.w - 8.0).min(270.0);
-        let art = Rect::new(l.x + (l.w - size) / 2.0, l.bottom() - size - below, size, size);
-        draw_rectangle(art.x + 4.0, art.y + 6.0, art.w, art.h, Color::new(0.0, 0.0, 0.0, 0.5));
-        match covers.as_slice() {
-            [] => round_rect(art, R_CHIP, Color::from_rgba(236, 231, 216, 255)),
-            [one] => cover_fit(one, art, 0.5, WHITE),
-            many => {
-                let half = size / 2.0;
-                for (k, tex) in many.iter().cycle().take(4).enumerate() {
-                    let (cx, cy) = ((k % 2) as f32, (k / 2) as f32);
-                    cover_fit(tex, Rect::new(art.x + cx * half, art.y + cy * half, half, half), 0.5, WHITE);
-                }
+        Some((Rect::new(l.x + (l.w - size) / 2.0, l.bottom() - size - below, size, size), chips))
+    }
+
+    /// Fills the space a short tracklist leaves with the cover and a summary
+    /// line (tracks, running time, genre). A click turns the cover over.
+    fn draw_sleeve(&self, l: Rect, i: usize, rows: usize) {
+        let a = &self.albums[i];
+        let Some((art, chips)) = self.sleeve_layout(l, i, rows) else { return };
+        match self.sleeve_turn {
+            t if t <= 0.0 || t >= 1.0 => {
+                draw_rectangle(art.x + 4.0, art.y + 6.0, art.w, art.h, Color::new(0.0, 0.0, 0.0, 0.5));
+                if t <= 0.0 { self.draw_sleeve_front(art, i) } else { self.draw_sleeve_back(art, i) }
+                let hovered = art.contains(mouse_position().into());
+                round_rect_lines(art, 2.0, 1.0, Color::new(1.0, 1.0, 1.0, if hovered { 0.5 } else { 0.25 }));
             }
+            t => self.draw_sleeve_turning(art, i, t),
         }
-        round_rect_lines(art, 2.0, 1.0, Color::new(1.0, 1.0, 1.0, 0.25));
 
         let total: f32 = a.tracks.iter().filter_map(|t| t.duration).map(|d| d.as_secs_f32()).sum();
         let minutes = (total / 60.0).round() as u32;
@@ -4394,6 +4420,247 @@ impl App {
                 x += w + GENRE_GAP;
             }
         }
+    }
+
+    /// What the back of the side list's cover lists: name, value and how
+    /// many lines the value may wrap to.
+    fn sleeve_rows(&self, i: usize) -> Vec<(&'static str, String, usize)> {
+        let a = &self.albums[i];
+        let mut rows = Vec::new();
+        if a.mix.is_some() {
+            let mut sources: Vec<_> = a.tracks.iter().filter_map(|t| t.path.parent()).collect();
+            sources.sort_unstable();
+            sources.dedup();
+            rows.push(("TYPE", "MIXTAPE".to_string(), 1));
+            if sources.len() > 1 {
+                rows.push(("ALBUMS", sources.len().to_string(), 1));
+            }
+        } else if !a.year.is_empty() {
+            rows.push(("YEAR", a.year.clone(), 1));
+        }
+        let genre = a.genre.split(';').map(str::trim).filter(|g| !g.is_empty()).collect::<Vec<_>>().join(", ");
+        if !genre.is_empty() {
+            rows.push(("GENRE", genre.to_uppercase(), 3));
+        }
+        rows.push(("TRACKS", a.tracks.len().to_string(), 1));
+        let total: f32 = a.tracks.iter().filter_map(|t| t.duration).map(|d| d.as_secs_f32()).sum();
+        let minutes = (total / 60.0).round() as u32;
+        if minutes > 0 {
+            let length = if minutes >= 60 { format!("{} H {:02} MIN", minutes / 60, minutes % 60) } else { format!("{minutes} MIN") };
+            rows.push(("LENGTH", length, 1));
+        }
+        // The format most of the tracks share.
+        let mut formats: HashMap<&str, usize> = HashMap::new();
+        for t in &a.tracks {
+            if let Some(fmt) = &t.format {
+                *formats.entry(fmt.as_str()).or_default() += 1;
+            }
+        }
+        if let Some((format, _)) = formats.into_iter().max_by_key(|&(_, n)| n) {
+            let hires = a.tracks.iter().any(|t| t.hires);
+            rows.push(("FORMAT", if hires { format!("{format}  HI-RES") } else { format.to_string() }, 1));
+        }
+        if a.bytes > 0 {
+            let mb = a.bytes as f64 / 1_048_576.0;
+            let size = if mb >= 1024.0 { format!("{:.1} GB", mb / 1024.0) } else { format!("{mb:.0} MB") };
+            rows.push(("SIZE", size, 1));
+        }
+        for (name, value) in &a.details {
+            let lines = if *name == "COPYRIGHT" { 3 } else { 2 };
+            rows.push((name, value.to_uppercase(), lines));
+        }
+        match self.plays.get(&a.rel).copied().unwrap_or(0) {
+            0 => {}
+            n => rows.push(("PLAYS", n.to_string(), 1)),
+        }
+        if a.mix.is_none() {
+            rows.push(("FOLDER", a.rel.clone(), 3));
+        }
+        rows
+    }
+
+    /// Margins of the cover's back: padding, text left edge and width, the
+    /// width of the names column, and the lowest baseline.
+    fn sleeve_back_frame(art: Rect) -> (f32, f32, f32, f32, f32) {
+        let pad = (art.w * 0.06).clamp(8.0, 14.0);
+        let w = art.w - 2.0 * pad;
+        (pad, art.x + pad, w, 68.0_f32.min(w * 0.4), art.bottom() - pad)
+    }
+
+    /// The rows on the cover's back with their values wrapped, the baseline
+    /// of the first one, and how far they scroll: until the last row sits
+    /// at the bottom.
+    fn sleeve_back_rows(&self, art: Rect, i: usize) -> (Vec<(&'static str, Vec<String>)>, f32, usize) {
+        let a = &self.albums[i];
+        let f = &self.fonts;
+        let (pad, _, w, key_w, bottom) = Self::sleeve_back_frame(art);
+        let title_lines = f.wrap(&a.album.to_uppercase(), 13.0, true, w, 2).len() as f32;
+        let artist = if a.artist.is_empty() { 0.0 } else { 14.0 };
+        let top = art.y + pad + 11.0 + title_lines * 15.0 + artist + 19.0;
+        let rows: Vec<_> = self.sleeve_rows(i).into_iter().map(|(key, value, lines)| (key, f.wrap(&value, 10.0, false, w - key_w, lines))).collect();
+        // Each row takes 13 per line and 3 after; the last needs only its
+        // first baseline above `bottom`.
+        let mut room = bottom - top + 16.0;
+        let mut max_first = rows.len();
+        while max_first > 0 {
+            let h = rows[max_first - 1].1.len() as f32 * 13.0 + 3.0;
+            if h > room {
+                break;
+            }
+            room -= h;
+            max_first -= 1;
+        }
+        let max_first = max_first.min(rows.len().saturating_sub(1));
+        (rows, top, max_first)
+    }
+
+    /// The back of the side list's cover: title, artist and the album's
+    /// details, faded in as the cover turns to face the front.
+    fn draw_sleeve_back(&self, art: Rect, i: usize) {
+        let a = &self.albums[i];
+        let f = &self.fonts;
+        round_rect(art, R_CHIP, self.tapes[i].shell);
+        let (ink, dim, alpha) = (INK, DIM, 1.0);
+        let (pad, x, w, key_w, bottom) = Self::sleeve_back_frame(art);
+
+        let mut y = art.y + pad + 11.0;
+        for line in f.wrap(&a.album.to_uppercase(), 13.0, true, w, 2) {
+            f.draw(&line, x, y, 13.0, ink, true);
+            y += 15.0;
+        }
+        if !a.artist.is_empty() {
+            f.draw(&f.fit(&a.artist.to_uppercase(), 10.0, false, w), x, y + 1.0, 10.0, dim, false);
+            y += 14.0;
+        }
+        y += 4.0;
+        draw_rectangle(x, y, w, 1.0, Color::new(1.0, 1.0, 1.0, 0.2 * alpha));
+        y += 15.0;
+
+        // Rows scroll under the title when they do not all fit.
+        let (rows, top, max_first) = self.sleeve_back_rows(art, i);
+        let first = self.sleeve_scroll.min(max_first);
+        let mut last = first;
+        for (key, wrapped) in &rows[first..] {
+            if y + (wrapped.len() - 1) as f32 * 13.0 > bottom {
+                break;
+            }
+            f.draw(key, x, y, 9.0, dim, true);
+            for line in wrapped {
+                f.draw(line, x + key_w, y, 10.0, ink, false);
+                y += 13.0;
+            }
+            y += 3.0;
+            last += 1;
+        }
+        if first > 0 || last < rows.len() {
+            let top = top - 10.0;
+            let track = bottom - top;
+            let n = rows.len() as f32;
+            let bar = Rect::new(art.right() - 4.0, top + track * first as f32 / n, 2.0, track * (last - first) as f32 / n);
+            draw_rectangle(bar.x, bar.y, bar.w, bar.h, Color::new(1.0, 1.0, 1.0, 0.3 * alpha));
+        }
+    }
+
+    /// The front of the side list's cover: the album's art, or a collage
+    /// of the covers a mixtape's tracks come from.
+    fn draw_sleeve_front(&self, art: Rect, i: usize) {
+        let covers = match self.albums[i].mix {
+            Some(_) => self.mix_covers(i),
+            None => self.tapes[i].cover.iter().cloned().collect(),
+        };
+        match covers.as_slice() {
+            [] => round_rect(art, R_CHIP, Color::from_rgba(236, 231, 216, 255)),
+            [one] => cover_fit(one, art, 0.5, WHITE),
+            many => {
+                let half = art.w / 2.0;
+                for (k, tex) in many.iter().cycle().take(4).enumerate() {
+                    let (cx, cy) = ((k % 2) as f32, (k / 2) as f32);
+                    cover_fit(tex, Rect::new(art.x + cx * half, art.y + cy * half, half, half), 0.5, WHITE);
+                }
+            }
+        }
+    }
+
+    /// The cover mid-turn: both sides painted into textures, then drawn as
+    /// a thin card swinging about its vertical axis, in perspective.
+    fn draw_sleeve_turning(&self, art: Rect, i: usize, t: f32) {
+        const SCALE: f32 = 2.0;
+        let mut cache = self.sleeve_faces.borrow_mut();
+        if cache.as_ref().is_none_or(|(size, ..)| *size != art.size()) {
+            let side = || {
+                let rt = render_target_ex((art.w * SCALE) as u32, (art.h * SCALE) as u32, RenderTargetParams { sample_count: CANVAS_SAMPLES, depth: false });
+                rt.texture.set_filter(FilterMode::Linear);
+                rt
+            };
+            *cache = Some((art.size(), side(), side()));
+        }
+        let Some((_, front, back)) = cache.as_ref() else { return };
+        for (rt, is_back) in [(front, false), (back, true)] {
+            let mut cam = Camera2D::from_display_rect(art);
+            cam.render_target = Some(rt.clone());
+            set_camera(&cam);
+            clear_background(Color::new(0.0, 0.0, 0.0, 0.0));
+            if is_back { self.draw_sleeve_back(art, i) } else { self.draw_sleeve_front(art, i) }
+        }
+        set_camera(&self.ui_camera());
+
+        let turn = t * t * (3.0 - 2.0 * t);
+        let (sin, cos) = (turn * PI).sin_cos();
+        let (c, hw, hh) = (art.center(), art.w / 2.0, art.h / 2.0);
+        let half_depth = (art.w * 0.012).max(1.5);
+        // Lifted toward the viewer halfway through, so it swings clear of the list.
+        let lift = sin * art.w * 0.15;
+        let dist = art.w * 2.2;
+        let project = |x: f32, y: f32, z: f32| {
+            let (rx, rz) = (x * cos - z * sin, x * sin + z * cos - lift);
+            let k = dist / (dist + rz);
+            vec2(c.x + rx * k, c.y + y * k)
+        };
+        // Faces turned away from the light darken.
+        let light = |b: f32| {
+            let v = (255.0 * b) as u8;
+            [v, v, v, 255]
+        };
+
+        // Shadow on the panel, falling further as the card rises.
+        let z = if cos >= 0.0 { -half_depth } else { half_depth };
+        let corners = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)].map(|(x, y)| project(x, y, z) + vec2(4.0, 6.0) * (1.0 + sin * 2.0));
+        let shadow = Color::new(0.0, 0.0, 0.0, 0.5 - 0.2 * sin);
+        draw_triangle(corners[0], corners[1], corners[2], shadow);
+        draw_triangle(corners[0], corners[2], corners[3], shadow);
+
+        // The card's thickness shows along the edge swinging toward the viewer.
+        let edge = [(-hw, -hh, -half_depth), (-hw, hh, -half_depth), (-hw, hh, half_depth), (-hw, -hh, half_depth)].map(|(x, y, z)| project(x, y, z));
+        let shell = self.tapes[i].shell;
+        let edge_color = Color::new(shell.r * 0.6 + 0.08, shell.g * 0.6 + 0.08, shell.b * 0.6 + 0.08, 1.0);
+        draw_triangle(edge[0], edge[1], edge[2], edge_color);
+        draw_triangle(edge[0], edge[2], edge[3], edge_color);
+
+        // The visible side as a grid, so the texture follows the perspective
+        // instead of shearing along one diagonal. Textures come out of the
+        // render target upside down.
+        let (rt, z, mirrored) = if cos >= 0.0 { (front, -half_depth, false) } else { (back, half_depth, true) };
+        let color = light(0.45 + 0.55 * cos.abs());
+        const COLS: usize = 16;
+        const ROWS: usize = 4;
+        let mut vertices = Vec::with_capacity((COLS + 1) * (ROWS + 1));
+        for gy in 0..=ROWS {
+            for gx in 0..=COLS {
+                let (u, v) = (gx as f32 / COLS as f32, gy as f32 / ROWS as f32);
+                let x = if mirrored { hw - u * art.w } else { -hw + u * art.w };
+                let p = project(x, -hh + v * art.h, z);
+                vertices.push(Vertex { position: p.extend(0.0), uv: vec2(u, 1.0 - v), color, normal: Vec4::ZERO });
+            }
+        }
+        let mut indices = Vec::with_capacity(COLS * ROWS * 6);
+        for gy in 0..ROWS {
+            for gx in 0..COLS {
+                let a = (gy * (COLS + 1) + gx) as u16;
+                let b = a + (COLS + 1) as u16;
+                indices.extend([a, a + 1, b + 1, a, b + 1, b]);
+            }
+        }
+        draw_mesh(&Mesh { vertices, indices, texture: Some(rt.texture.clone()) });
     }
 
     /// Genre tags split into chips and laid out centered in at most two rows;

@@ -1756,6 +1756,7 @@ dependencies = [
  "serde",
  "serde_json",
  "souvlaki",
+ "ttf-parser",
  "zbus",
  "zvariant",
 ]

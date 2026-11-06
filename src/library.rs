@@ -42,6 +42,11 @@ pub struct Album {
     pub tracks: Vec<Track>,
     /// Track tags are read lazily, when the tape is first loaded.
     pub tracks_read: bool,
+    /// Release details from the first track's tags (label, catalog number,
+    /// dates...), as name and value; read with the track tags.
+    pub details: Vec<(&'static str, String)>,
+    /// Size of the audio files on disk, in bytes; read with the track tags.
+    pub bytes: u64,
     /// Set for mixtapes; 0 is the blank tape that starts a new one.
     pub mix: Option<u64>,
 }
@@ -58,7 +63,7 @@ pub fn scan(root: &Path) -> (Vec<Album>, Vec<PathBuf>) {
             let rel = dir.strip_prefix(root).unwrap_or(&dir).to_string_lossy().into_owned();
             let (album, artist, year, genre) = album_tags(&dir.join(&files[0]), &rel);
             let tracks = files.iter().map(|f| track_from_path(dir.join(f))).collect();
-            Album { rel, dir, album, artist, year, genre, tracks, tracks_read: false, mix: None }
+            Album { rel, dir, album, artist, year, genre, tracks, tracks_read: false, details: Vec::new(), bytes: 0, mix: None }
         })
         .collect();
     albums.sort_by(|a, b| {
@@ -198,16 +203,60 @@ pub fn read_track_tags(album: &mut Album) {
     }
     album.tracks_read = true;
     let opts = ParseOptions::new().read_cover_art(false);
-    for t in &mut album.tracks {
+    let mut discs = 0;
+    for (k, t) in album.tracks.iter_mut().enumerate() {
+        album.bytes += std::fs::metadata(&t.path).map(|m| m.len()).unwrap_or(0);
         let Ok(tagged) = Probe::open(&t.path).and_then(|p| p.options(opts).read()) else { continue };
         let props = tagged.properties();
         t.duration = Some(props.duration());
         t.format = Some(format_label(tagged.file_type(), props));
         t.hires = props.bit_depth().is_some_and(|b| b > 16) || props.sample_rate().is_some_and(|r| r > 48_000);
-        if let Some(title) = tagged.primary_tag().or_else(|| tagged.first_tag()).and_then(|tag| tag.title()) {
+        let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else { continue };
+        if let Some(title) = tag.title() {
             t.title = title.into_owned();
         }
+        discs = discs.max(tag.disk().unwrap_or(0)).max(tag.disk_total().unwrap_or(0));
+        // A mixtape's first track speaks for its own album, not the tape.
+        if k == 0 && album.mix.is_none() {
+            album.details = album_details(tag, &album.year);
+        }
     }
+    if discs > 1 && album.mix.is_none() {
+        album.details.push(("DISCS", discs.to_string()));
+    }
+}
+
+/// Release details worth showing beside the album's title, artist and year.
+fn album_details(tag: &lofty::tag::Tag, year: &str) -> Vec<(&'static str, String)> {
+    let get = |key: ItemKey| tag.get_string(key).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let mut out = Vec::new();
+    // Dates only when they say more than the year already shown.
+    let released = get(ItemKey::ReleaseDate).or_else(|| get(ItemKey::RecordingDate)).filter(|d| d != year);
+    if let Some(original) = get(ItemKey::OriginalReleaseDate).filter(|d| d.len() > 4 && Some(d) != released.as_ref()) {
+        out.push(("ORIGINAL", original));
+    }
+    if let Some(released) = released {
+        out.push(("RELEASED", released));
+    }
+    let keys = [
+        ("LABEL", ItemKey::Label),
+        ("LABEL", ItemKey::Publisher),
+        ("CATALOG", ItemKey::CatalogNumber),
+        ("COUNTRY", ItemKey::ReleaseCountry),
+        ("TYPE", ItemKey::MusicBrainzReleaseType),
+        ("MEDIA", ItemKey::OriginalMediaType),
+        ("COMPOSER", ItemKey::Composer),
+        ("PRODUCER", ItemKey::Producer),
+        ("ENGINEER", ItemKey::Engineer),
+        ("BARCODE", ItemKey::Barcode),
+        ("COPYRIGHT", ItemKey::CopyrightMessage),
+    ];
+    for (name, key) in keys {
+        if let Some(value) = get(key).filter(|_| !out.iter().any(|(n, _)| *n == name)) {
+            out.push((name, value));
+        }
+    }
+    out
 }
 
 fn format_label(kind: lofty::file::FileType, props: &lofty::properties::FileProperties) -> String {

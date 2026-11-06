@@ -48,6 +48,8 @@ pub fn album(m: &Mixtape) -> Album {
         genre: String::new(),
         tracks: m.tracks.iter().cloned().map(library::track_from_path).collect(),
         tracks_read: false,
+        details: Vec::new(),
+        bytes: 0,
         mix: Some(m.id),
     }
 }
@@ -63,6 +65,8 @@ pub fn blank() -> Album {
         genre: String::new(),
         tracks: Vec::new(),
         tracks_read: true,
+        details: Vec::new(),
+        bytes: 0,
         mix: Some(0),
     }
 }
