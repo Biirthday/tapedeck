@@ -12,6 +12,8 @@ pub struct Settings {
     pub mpris: bool,
     /// Tint highlights with the playing cover's color.
     pub accents: bool,
+    /// Square panels, boxes and chips instead of rounded ones.
+    pub square: bool,
     /// Off, low, normal, high.
     pub reflections: usize,
     pub glass: usize,
@@ -34,6 +36,7 @@ impl Default for Settings {
             seek_step: 1,
             mpris: true,
             accents: true,
+            square: false,
             reflections: 2,
             glass: 2,
             glow: 2,
@@ -49,6 +52,7 @@ impl Default for Settings {
 pub const SEEK_STEPS: [&str; 4] = ["5 S", "10 S", "15 S", "30 S"];
 pub const LEVELS: [&str; 4] = ["OFF", "LOW", "NORMAL", "HIGH"];
 pub const PACES: [&str; 3] = ["SLOW", "NORMAL", "FAST"];
+pub const CORNERS: [&str; 2] = ["ROUNDED", "SQUARE"];
 pub const LYRIC_PACES: [&str; 3] = ["RELAXED", "NORMAL", "SNAPPY"];
 pub const PLAYING_FPS: [&str; 3] = ["30", "60", "FULL"];
 pub const IDLE_FPS: [&str; 3] = ["12", "30", "FULL"];

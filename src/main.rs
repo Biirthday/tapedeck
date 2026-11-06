@@ -10,7 +10,7 @@ use std::f32::consts::{FRAC_PI_2, PI};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use audio::{Audio, Sfx};
 use desktop::{Desktop, MediaControlEvent, NowPlaying, SeekDirection};
-use gfx::{DIM, FACE_H, FACE_W, FaceStyle, Fonts, INK, LINE, cover_fit, ring, round_rect, round_rect_lines};
+use gfx::{DIM, FACE_H, FACE_W, FaceStyle, Fonts, INK, LINE, cover_fit, ring};
 use library::{Album, BLUR_SIZE, Cover, LyricLine, Lyrics};
 use mixtape::Mixtape;
 use settings::Settings;
@@ -36,6 +36,9 @@ const RAIL_TO_ORIGIN: f32 = 0.16;
 const VISIBLE: (f32, f32) = (-2.6, 17.0);
 /// Rail positions over which the farthest tapes fade out.
 const FAR_FADE: f32 = 10.0;
+/// Extra width of the active sort switch for its direction arrow.
+const SORT_ARROW: f32 = 10.0;
+
 /// Width the view and sort switches take in the stage's top right corner.
 const SWITCHES_W: f32 = 500.0;
 /// Direction the key light comes from, on the tape's face plane, and how
@@ -123,6 +126,23 @@ const R_PANEL: f32 = 12.0;
 const R_BOX: f32 = 6.0;
 const R_CHIP: f32 = 4.0;
 
+/// The "square corners" setting, read by the drawing helpers below.
+static SQUARE: AtomicBool = AtomicBool::new(false);
+
+/// A UI corner radius, or none with square corners. The tapes' own shells
+/// draw through `gfx` and stay rounded.
+fn corner(radius: f32) -> f32 {
+    if SQUARE.load(Ordering::Relaxed) { 0.0 } else { radius }
+}
+
+fn round_rect(r: Rect, radius: f32, color: Color) {
+    gfx::round_rect(r, corner(radius), color);
+}
+
+fn round_rect_lines(r: Rect, radius: f32, thickness: f32, color: Color) {
+    gfx::round_rect_lines(r, corner(radius), thickness, color);
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Default)]
 enum Sort {
     #[default]
@@ -144,6 +164,11 @@ impl Sort {
             Sort::Recent => "RECENT",
             Sort::Color => "COLOR",
         }
+    }
+
+    /// Whether the unreversed order runs high to low (most played, newest first).
+    fn descends(self) -> bool {
+        matches!(self, Sort::Played | Sort::Recent)
     }
 }
 
@@ -313,6 +338,9 @@ struct Saved {
     volume: Option<f32>,
     #[serde(default)]
     sort: Sort,
+    /// The sort runs against its usual direction.
+    #[serde(default)]
+    sort_rev: bool,
     #[serde(default)]
     fullscreen: bool,
     /// Play queue as (album path relative to the library, track index);
@@ -566,6 +594,7 @@ struct App {
     colors_saved: bool,
     next_id: usize,
     sort: Sort,
+    sort_rev: bool,
     fullscreen: bool,
     plays: HashMap<String, u32>,
     played_at: HashMap<String, u64>,
@@ -743,6 +772,7 @@ impl App {
             })
             .collect();
         let (covers, covers_done) = library::spawn_cover_workers(jobs);
+        SQUARE.store(saved.settings.square, Ordering::Relaxed);
         let mut app = Self {
             tapes,
             face_pool: Vec::new(),
@@ -757,6 +787,7 @@ impl App {
             colors_saved: false,
             next_id: albums.len(),
             sort: saved.sort,
+            sort_rev: saved.sort_rev,
             fullscreen: saved.fullscreen,
             plays: saved.plays,
             played_at: saved.played_at,
@@ -924,18 +955,26 @@ impl App {
         }
         let by_artist = || library::icase_cmp(&x.artist, &y.artist).then_with(|| x.year.cmp(&y.year));
         let plays = |a: &Album| self.plays.get(&a.rel).copied().unwrap_or(0);
+        let rev = |o: std::cmp::Ordering| if self.sort_rev { o.reverse() } else { o };
+        // Reversing flips the key only: tapes without a year or a last play
+        // stay at the tail, and ties stay by artist.
         match self.sort {
-            Sort::Artist => by_artist(),
-            Sort::Year => (x.year.is_empty(), &x.year).cmp(&(y.year.is_empty(), &y.year)).then_with(by_artist),
-            Sort::Played => plays(y).cmp(&plays(x)).then_with(by_artist),
+            Sort::Artist => rev(by_artist()),
+            Sort::Year => x
+                .year
+                .is_empty()
+                .cmp(&y.year.is_empty())
+                .then_with(|| rev(x.year.cmp(&y.year)))
+                .then_with(by_artist),
+            Sort::Played => rev(plays(y).cmp(&plays(x))).then_with(by_artist),
             // Most recent first; never-played tapes after, by artist.
             Sort::Recent => {
                 let at = |a: &Album| self.played_at.get(&a.rel).copied();
-                at(y).cmp(&at(x)).then_with(by_artist)
+                at(x).is_none().cmp(&at(y).is_none()).then_with(|| rev(at(y).cmp(&at(x)))).then_with(by_artist)
             }
             Sort::Color => {
                 let (kx, ky) = (color_key(self.tapes[a].average), color_key(self.tapes[b].average));
-                kx.0.cmp(&ky.0).then(kx.1.total_cmp(&ky.1)).then_with(by_artist)
+                rev(kx.0.cmp(&ky.0).then(kx.1.total_cmp(&ky.1))).then_with(by_artist)
             }
         }
     }
@@ -974,12 +1013,21 @@ impl App {
         }
     }
 
+    /// Picks a sort in its usual direction.
     fn set_sort(&mut self, sort: Sort) {
         if self.sort != sort {
             self.sort = sort;
+            self.sort_rev = false;
             self.apply_sort(true);
             self.save();
         }
+    }
+
+    /// Runs the current sort the other way.
+    fn reverse_sort(&mut self) {
+        self.sort_rev = !self.sort_rev;
+        self.apply_sort(true);
+        self.save();
     }
 
     /* ---------- Mixtapes ---------- */
@@ -1136,6 +1184,7 @@ impl App {
             time: self.audio.position().as_secs_f32(),
             volume: Some(self.volume),
             sort: self.sort,
+            sort_rev: self.sort_rev,
             fullscreen: self.fullscreen,
             queue: self
                 .queue
@@ -1876,7 +1925,11 @@ impl App {
             } else if let Some((view, _)) = self.view_pills(lay).into_iter().find(|(_, r)| r.contains(mouse)) {
                 self.set_view(view);
             } else if let Some((sort, _)) = self.sort_pills(lay).into_iter().find(|(_, r)| r.contains(mouse)) {
-                self.set_sort(sort);
+                if sort == self.sort {
+                    self.reverse_sort();
+                } else {
+                    self.set_sort(sort);
+                }
             } else if !on_lyrics && lay.stage.contains(mouse) {
                 self.drag = Some((mouse.x, self.target, false));
             }
@@ -2488,7 +2541,9 @@ impl App {
             .iter()
             .rev()
             .map(|&sort| {
-                let w = self.fonts.width(sort.label(), 10.0, true) + 14.0;
+                // The active pill grows to fit its direction arrow.
+                let arrow = if sort == self.sort { SORT_ARROW } else { 0.0 };
+                let w = self.fonts.width(sort.label(), 10.0, true) + 14.0 + arrow;
                 x -= w;
                 let r = Rect::new(x, lay.stage.y + SP_M, w, 18.0);
                 x -= 4.0;
@@ -2883,8 +2938,9 @@ impl App {
             (vec2(s.right(), s.bottom()), 0.0),
             (vec2(s.x, s.bottom()), FRAC_PI_2),
         ] {
-            let center = corner + vec2(if corner.x > s.x { -R_PANEL } else { R_PANEL }, if corner.y > s.y { -R_PANEL } else { R_PANEL });
-            corner_mask(corner, center, R_PANEL, start, FRAME_BG);
+            let rad = self::corner(R_PANEL);
+            let center = corner + vec2(if corner.x > s.x { -rad } else { rad }, if corner.y > s.y { -rad } else { rad });
+            corner_mask(corner, center, rad, start, FRAME_BG);
         }
         round_rect_lines(s, R_PANEL, 1.5, LINE);
         let c = s.center();
@@ -3020,6 +3076,7 @@ impl App {
             Field::Reflections | Field::Glass | Field::Glow => LEVELS.to_vec(),
             Field::Motion | Field::KeyRepeat => PACES.to_vec(),
             Field::LyricPace => LYRIC_PACES.to_vec(),
+            Field::Corners => CORNERS.to_vec(),
             Field::PlayingFps => PLAYING_FPS.to_vec(),
             Field::IdleFps => IDLE_FPS.to_vec(),
             Field::MusicFolder => vec!["BROWSE", "TYPE", "RESCAN"],
@@ -3038,6 +3095,7 @@ impl App {
             Field::Sort => Sort::ALL.iter().position(|&v| v == self.sort).unwrap_or(0),
             Field::Fullscreen => self.fullscreen as usize,
             Field::Accents => s.accents as usize,
+            Field::Corners => s.square as usize,
             Field::Reflections => s.reflections,
             Field::Glass => s.glass,
             Field::Glow => s.glow,
@@ -3066,6 +3124,12 @@ impl App {
                 set_fullscreen(self.fullscreen);
             }
             Field::Accents => self.settings.accents = v == 1,
+            Field::Corners => {
+                self.settings.square = v == 1;
+                SQUARE.store(self.settings.square, Ordering::Relaxed);
+                // The deck body is painted once; repaint it with the new corners.
+                *self.deck_cache.borrow_mut() = None;
+            }
             Field::Reflections => self.settings.reflections = v,
             Field::Glass => {
                 self.settings.glass = v;
@@ -3815,6 +3879,12 @@ impl App {
                 round_rect_lines(r, R_CHIP, 1.0, Color::new(1.0, 1.0, 1.0, 0.35));
             }
             self.fonts.draw(sort.label(), r.x + 7.0, r.y + 13.0, 10.0, if on { BLACK } else { DIM }, true);
+            if on {
+                // Up runs low to high (A to Z, oldest first), down high to low.
+                let (cx, cy) = (r.right() - 7.0 - SORT_ARROW / 2.0 + 2.0, r.y + r.h / 2.0);
+                let (tip, foot) = if sort.descends() != self.sort_rev { (3.0, -3.0) } else { (-3.0, 3.0) };
+                draw_triangle(vec2(cx, cy + tip), vec2(cx - 3.5, cy + foot), vec2(cx + 3.5, cy + foot), BLACK);
+            }
         }
     }
 
@@ -3827,7 +3897,8 @@ impl App {
         let base = r.bottom() - 4.0;
         let (a, b) = self.view_span();
         let (a, b) = (a.max(0.0), b.min(n as f32 - 1.0));
-        let window = Rect::new(x_of(a), base - 15.0, (x_of(b) - x_of(a)).max(4.0), 15.0);
+        // Kept under the labels so its top edge never strikes through them.
+        let window = Rect::new(x_of(a), base - 10.0, (x_of(b) - x_of(a)).max(4.0), 10.0);
         draw_rectangle(window.x, window.y, window.w, window.h, Color::new(1.0, 1.0, 1.0, 0.07));
         draw_rectangle(window.x, window.y, window.w, 1.0, Color::new(1.0, 1.0, 1.0, 0.35));
         draw_rectangle(r.x, base, r.w, 1.0, Color::new(1.0, 1.0, 1.0, 0.3));
@@ -3837,10 +3908,8 @@ impl App {
         let mouse: Vec2 = mouse_position().into();
         let pointing = r.contains(mouse) || self.ruler_drag;
         let pointed = pointing.then(|| (((mouse.x - r.x) / r.w * n as f32).floor().max(0.0) as usize).min(n - 1));
-        let mut last_label = f32::MIN;
-        let mut last_artist_char: Option<char> = None;
-        let mut last_key: &str = "";
-        let mut char_buf = [0u8; 4];
+        // Runs of tapes sharing a label, as (label, first tick x, last tick x).
+        let mut groups: Vec<(String, f32, f32)> = Vec::new();
         for i in 0..n {
             let (album, tape) = (&self.albums[i], &self.tapes[i]);
             let x = x_of(i as f32);
@@ -3862,49 +3931,44 @@ impl App {
             };
             draw_rectangle(x - tick_w / 2.0, base - h, tick_w, h, color);
 
-            let key: &str = match (album.mix, self.sort) {
-                (Some(_), _) => {
-                    last_artist_char = None;
-                    "MIX"
-                }
-                (None, Sort::Artist) => {
-                    let ch = album
-                        .artist
-                        .chars()
-                        .next()
-                        .filter(|c| c.is_alphanumeric())
-                        .and_then(|c| c.to_uppercase().next())
-                        .unwrap_or('#');
-                    if last_artist_char == Some(ch) {
-                        continue;
-                    }
-                    last_artist_char = Some(ch);
-                    last_key = "";
-                    let s = ch.encode_utf8(&mut char_buf);
-                    let w = self.fonts.width(s, 10.0, false);
-                    if x - last_label >= 6.0 {
-                        self.fonts.draw(s, x - 1.0, r.y + 8.0, 10.0, DIM, false);
-                        last_label = x + w;
-                    }
-                    continue;
-                }
-                (None, Sort::Year) => &album.year,
+            let key: String = match (album.mix, self.sort) {
+                (Some(_), _) => "MIX".into(),
+                (None, Sort::Artist) => album
+                    .artist
+                    .chars()
+                    .next()
+                    .filter(|c| c.is_alphanumeric())
+                    .and_then(|c| c.to_uppercase().next())
+                    .unwrap_or('#')
+                    .into(),
+                (None, Sort::Year) => album.year.clone(),
                 (None, Sort::Played) => match self.plays.get(&album.rel).copied().unwrap_or(0) {
                     0 => "NEVER",
-                    _ if i == 0 || self.albums[i - 1].mix.is_some() => "MOST",
-                    _ => last_key,
-                },
-                (None, Sort::Recent) => recency(self.played_at.get(&album.rel).copied()),
-                (None, Sort::Color) => "",
-            };
-            if key != last_key && !key.is_empty() {
-                let w = self.fonts.width(key, 10.0, false);
-                if x - last_label >= 6.0 {
-                    self.fonts.draw(key, x - 1.0, r.y + 8.0, 10.0, DIM, false);
-                    last_label = x + w;
+                    _ if self.sort_rev => "LEAST",
+                    _ => "MOST",
                 }
+                .into(),
+                (None, Sort::Recent) => recency(self.played_at.get(&album.rel).copied()).into(),
+                (None, Sort::Color) => String::new(),
+            };
+            match groups.last_mut() {
+                Some(g) if g.0 == key => g.2 = x,
+                _ => groups.push((key, x, x)),
             }
-            last_key = key;
+        }
+        // Each label goes at the start of its run, or slides right within the
+        // run to clear the one before; a run too short for that goes unlabeled.
+        const LABEL_GAP: f32 = 8.0;
+        let mut last_label = f32::MIN;
+        for (key, first, last) in &groups {
+            if key.is_empty() {
+                continue;
+            }
+            let x = (first - 1.0).max(last_label + LABEL_GAP);
+            if x <= last - 1.0 {
+                self.fonts.draw(key, x, r.y + 8.0, 10.0, DIM, false);
+                last_label = x + self.fonts.width(key, 10.0, false);
+            }
         }
         if let Some(i) = self.current {
             let x = x_of(i as f32);
@@ -4372,8 +4436,9 @@ impl App {
     /// side and title, the cover behind the window, and the reels winding.
     fn draw_deck_cassette(&self, mini: Rect, i: usize) {
         let (tape, album, f) = (&self.tapes[i], &self.albums[i], &self.fonts);
-        round_rect(mini, R_BOX, tape.shell);
-        round_rect_lines(mini, R_BOX, 1.0, Color::new(1.0, 1.0, 1.0, 0.25));
+        // A tape, not UI: rounded whatever the corner setting.
+        gfx::round_rect(mini, R_BOX, tape.shell);
+        gfx::round_rect_lines(mini, R_BOX, 1.0, Color::new(1.0, 1.0, 1.0, 0.25));
         let label = Rect::new(mini.x + 6.0, mini.y + 5.0, mini.w - 12.0, mini.h - 16.0);
         if let Some(tex) = &tape.cover {
             cover_fit(tex, label, 0.4, WHITE);
@@ -4462,8 +4527,9 @@ impl App {
             y += 2.0;
             k += 1;
         }
-        draw_rectangle(d.x + R_PANEL, d.y + 1.0, d.w - 2.0 * R_PANEL, 1.0, Color::new(1.0, 1.0, 1.0, 0.25));
-        draw_rectangle(d.x + R_PANEL, d.bottom() - 2.0, d.w - 2.0 * R_PANEL, 1.0, Color::new(0.0, 0.0, 0.0, 0.5));
+        let rad = corner(R_PANEL);
+        draw_rectangle(d.x + rad, d.y + 1.0, d.w - 2.0 * rad, 1.0, Color::new(1.0, 1.0, 1.0, 0.25));
+        draw_rectangle(d.x + rad, d.bottom() - 2.0, d.w - 2.0 * rad, 1.0, Color::new(0.0, 0.0, 0.0, 0.5));
         round_rect_lines(d, R_PANEL, 1.5, LINE);
 
         // Speaker plate; its holes are drawn live.
@@ -4804,6 +4870,7 @@ enum Field {
     Sort,
     Fullscreen,
     Accents,
+    Corners,
     Reflections,
     Glass,
     Glow,
@@ -4817,7 +4884,7 @@ enum Field {
 }
 
 /// The settings panel, grouped under headings: (heading, field, label).
-const FIELDS: [(&str, Field, &str); 18] = [
+const FIELDS: [(&str, Field, &str); 19] = [
     ("PLAYBACK", Field::Volume, "Volume"),
     ("PLAYBACK", Field::SeekStep, "Seek step ( [ ] and media keys)"),
     ("PLAYBACK", Field::Sfx, "Deck sound effects"),
@@ -4826,6 +4893,7 @@ const FIELDS: [(&str, Field, &str); 18] = [
     ("LOOK", Field::Sort, "Sort"),
     ("LOOK", Field::Fullscreen, "Fullscreen"),
     ("LOOK", Field::Accents, "Colors from the cover"),
+    ("LOOK", Field::Corners, "Corners"),
     ("LOOK", Field::Reflections, "Floor reflections"),
     ("LOOK", Field::Glass, "Reflections on the plastic"),
     ("LOOK", Field::Glow, "Cover light on the stage"),
