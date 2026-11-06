@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Tapedeck
+GenericName=Music Player
+GenericName[pt_BR]=Reprodutor de música
+Comment=A cassette-wall music player for your local library
+Comment[pt_BR]=Um reprodutor de música em fitas cassete para a sua biblioteca local
+Exec=tapedeck
+TryExec=tapedeck
+Icon=tapedeck
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=music;player;cassette;tape;flac;lyrics;
+StartupWMClass=tapedeck

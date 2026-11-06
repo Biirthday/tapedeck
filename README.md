@@ -67,6 +67,16 @@ To install the binary into `~/.cargo/bin`:
 cargo install --path .
 ```
 
+To add Tapedeck to your application launcher, with its icon:
+
+```sh
+install -Dm644 assets/tapedeck.desktop ~/.local/share/applications/tapedeck.desktop
+install -Dm644 assets/tapedeck.svg ~/.local/share/icons/hicolor/scalable/apps/tapedeck.svg
+```
+
+The entry runs `tapedeck` from your `PATH`; edit its `Exec` line if the binary
+lives elsewhere.
+
 Tapedeck reads the system's music folder (usually `~/Music`). To use another
 one, open the settings (`Ctrl+,` or `F2`) and choose **Music folder**:
 **BROWSE** opens the desktop's folder chooser, and **TYPE** lets you enter a

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- Tapedeck: a C-60 cassette with a paper label and its reel window. -->
+  <rect x="6" y="22" width="116" height="84" rx="9" fill="#2a2b2f"/>
+  <rect x="6" y="22" width="116" height="84" rx="9" fill="none" stroke="#5c5e64" stroke-width="2"/>
+  <rect x="15" y="30" width="98" height="46" rx="4" fill="#ece7d8"/>
+  <rect x="15" y="30" width="98" height="11" rx="4" fill="#d96a45"/>
+  <rect x="15" y="37" width="98" height="4" fill="#d96a45"/>
+  <rect x="20" y="33" width="6" height="6" fill="none" stroke="#ece7d8" stroke-width="1.2"/>
+  <rect x="32" y="45" width="64" height="24" rx="12" fill="#141518"/>
+  <circle cx="45" cy="57" r="9" fill="#5a3d27"/>
+  <circle cx="83" cy="57" r="6" fill="#5a3d27"/>
+  <circle cx="45" cy="57" r="4.5" fill="#e6e6e2"/>
+  <circle cx="83" cy="57" r="4.5" fill="#e6e6e2"/>
+  <circle cx="45" cy="57" r="1.6" fill="#141518"/>
+  <circle cx="83" cy="57" r="1.6" fill="#141518"/>
+  <path d="M34 106 L40 86 H88 L94 106 Z" fill="#141518"/>
+  <circle cx="52" cy="97" r="3" fill="#2a2b2f"/>
+  <circle cx="76" cy="97" r="3" fill="#2a2b2f"/>
+  <rect x="60" y="94" width="8" height="5" fill="#c4b896"/>
+  <circle cx="13" cy="29" r="2" fill="#8a8c92"/>
+  <circle cx="115" cy="29" r="2" fill="#8a8c92"/>
+  <circle cx="13" cy="99" r="2" fill="#8a8c92"/>
+  <circle cx="115" cy="99" r="2" fill="#8a8c92"/>
+</svg>

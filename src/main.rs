@@ -297,6 +297,9 @@ fn window_conf() -> Conf {
         window_height: 800,
         window_resizable: true,
         high_dpi: false,
+        // Matches StartupWMClass in tapedeck.desktop, so docks and bars tie the
+        // window to its launcher and icon.
+        platform: macroquad::miniquad::conf::Platform { linux_wm_class: "tapedeck", ..Default::default() },
         ..Default::default()
     }
 }
