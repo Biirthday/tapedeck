@@ -100,6 +100,12 @@ const GENRE_PAD: f32 = 6.0;
 /// Grid tracklist panel: header height and row pitch.
 const GRID_CARD_HEAD: f32 = 104.0;
 const GRID_CARD_ROW: f32 = 24.0;
+/// Angle of the volume knob's pointer for a level, 0..1: from bottom left
+/// round through the top to bottom right.
+fn knob_angle(v: f32) -> f32 {
+    (-135.0 + v * 270.0).to_radians() - FRAC_PI_2
+}
+
 /// Height of the cassette player in the side column.
 const DECK_H: f32 = 326.0;
 /// Brushed gunmetal of the player's body, its keys, and its LCD.
@@ -656,6 +662,8 @@ struct App {
     flipped: Option<usize>,
     jcard_page: usize,
     jcard: Option<(usize, usize, RenderTarget)>,
+    /// The deck's still parts, painted for the deck rectangle they fit.
+    deck_cache: std::cell::RefCell<Option<(Rect, RenderTarget)>>,
     level: f32,
     /// Multisampled canvas the whole frame is drawn into, then copied to the
     /// window: smooth edges without relying on the window's own MSAA.
@@ -792,6 +800,7 @@ impl App {
             flipped: None,
             jcard_page: 0,
             jcard: None,
+            deck_cache: Default::default(),
             level: 0.0,
             canvas: None,
             edge: edge_texture(),
@@ -2717,6 +2726,11 @@ impl App {
         cam.pass = self.canvas.as_ref().map(|c| c.render_pass.clone());
         set_camera(&cam);
         let rail = if self.view == View::Rail { self.visible() } else { 0..0 };
+        // Draw calls are what the GPU driver spends its time on, and a batch
+        // ends whenever the texture changes. So every tape is drawn in passes
+        // that share a texture: plain plastic, the ridged edges, the printed
+        // faces, and last the clear plastic and highlights, far to near.
+        let mut tapes = Vec::new();
         for i in rail.rev() {
             let p = i as f32 - self.scroll;
             // The far end of the rail sinks into the dark over a long, eased
@@ -2730,21 +2744,29 @@ impl App {
                 1.0
             }
             .clamp(0.0, 1.0);
+            tapes.push((i, fade));
+        }
+        for pass in [Pass::Solid, Pass::Edge, Pass::Face, Pass::Clear] {
+            for &(i, fade) in &tapes {
+                let t = &self.tapes[i];
+                // Tapes resting on the rail reflect in the floor; one being turned
+                // around or leaving for the deck has left it.
+                if t.flip < 0.01 && t.out < 0.02 {
+                    self.draw_tape(lay, i, fade, true, pass);
+                }
+                // A tape on its way to the deck comes out of the dark of the far
+                // rail into full light, and is gone once it has left the stage.
+                if t.out < 0.999 {
+                    let lit = fade + (1.0 - fade) * (t.out * 4.0).min(1.0);
+                    self.draw_tape(lay, i, lit, false, pass);
+                }
+            }
+        }
+        // Gaps are lines, a different draw mode: they get their own batch.
+        for &(i, fade) in &tapes {
             let out = self.tapes[i].out;
             if out > 0.01 {
                 self.draw_gap(lay, i, fade * out);
-            }
-            // Tapes resting on the rail reflect in the floor; one being turned
-            // around or leaving for the deck has left it.
-            let t = &self.tapes[i];
-            if t.flip < 0.01 && out < 0.02 {
-                self.draw_tape(lay, i, fade, true);
-            }
-            // A tape on its way to the deck comes out of the dark of the far
-            // rail into full light, and is gone once it has left the stage.
-            if out < 0.999 {
-                let lit = fade + (1.0 - fade) * (out * 4.0).min(1.0);
-                self.draw_tape(lay, i, lit, false);
             }
         }
         set_camera(&self.ui_camera());
@@ -2968,19 +2990,17 @@ impl App {
                 indices.extend([a as u16, b as u16, c2 as u16, a as u16, c2 as u16, d as u16]);
             }
         }
-        let mut gl = unsafe { get_internal_gl() };
-        gl.flush();
+        let gl = unsafe { get_internal_gl() };
         gl.quad_gl.scissor(Some((s.x as i32, s.y as i32, s.w as i32, s.h as i32)));
         draw_mesh(&Mesh { vertices, indices, texture: None });
-        let mut gl = unsafe { get_internal_gl() };
-        gl.flush();
+        let gl = unsafe { get_internal_gl() };
         gl.quad_gl.scissor(None);
     }
 
     /// Draws a tape, or with `mirror` its reflection in the glossy floor its
     /// rail position stands on: flipped through that floor, dim, and fading
     /// out away from it.
-    fn draw_tape(&self, lay: &Layout, i: usize, fade: f32, mirror: bool) {
+    fn draw_tape(&self, lay: &Layout, i: usize, fade: f32, mirror: bool, pass: Pass) {
         let tape = &self.tapes[i];
         let h = TAPE / 2.0;
         let m = if mirror {
@@ -3021,106 +3041,119 @@ impl App {
             let v = if front { v + 190.0 * glint(p, n) } else { v * 0.4 };
             [v.min(255.0) as u8; 3]
         };
-        let mut vertices = Vec::with_capacity(outline.len() * 2 + 1);
-        let mut indices = Vec::with_capacity(outline.len() * 9);
-        for &(p, n) in outline {
-            vertices.push(vert(p.extend(h.z), Vec2::ZERO, lit(p, n, true)));
-            vertices.push(vert(p.extend(-h.z), Vec2::ZERO, lit(p, n, false)));
-        }
         let count = outline.len() as u16;
-        for k in 0..count {
-            let (a0, b0) = (k * 2, k * 2 + 1);
-            let (a1, b1) = (((k + 1) % count) * 2, ((k + 1) % count) * 2 + 1);
-            indices.extend([a0, a1, b1, a0, b1, b0]);
-        }
-        // Back plate as a fan around the center; a turned tape shows its
-        // card through a clear back instead.
         let card = tape.flip > 0.3 && !mirror && self.jcard.as_ref().is_some_and(|(j, _, _)| *j == i);
-        if !card {
-            let center = vertices.len() as u16;
-            vertices.push(vert(vec3(0.0, 0.0, -h.z), Vec2::ZERO, [14, 14, 14]));
-            for k in 0..count {
-                indices.extend([center, k * 2 + 1, ((k + 1) % count) * 2 + 1]);
-            }
-        }
-        draw_mesh(&Mesh { vertices, indices, texture: None });
-
-        // Ridged top edge along the straight part of the shell.
-        let (r, y, top) = (gfx::FACE_RADIUS / FACE_W * TAPE.x, h.y + 0.002, [255, 255, 255]);
-        let edge = vec![
-            vert(vec3(-h.x + r, y, h.z), vec2(0.0, 0.0), top),
-            vert(vec3(h.x - r, y, h.z), vec2(1.0, 0.0), top),
-            vert(vec3(h.x - r, y, -h.z), vec2(1.0, 1.0), top),
-            vert(vec3(-h.x + r, y, -h.z), vec2(0.0, 1.0), top),
-        ];
-        draw_mesh(&Mesh { vertices: edge, indices: vec![0, 1, 2, 0, 2, 3], texture: Some(self.edge.clone()) });
-
-        // The printed front sits inside the shell, under a clear plastic
-        // window that is flush with the rim.
         let white = [255, 255, 255];
         let face_z = h.z - RECESS;
-        let front = vec![
-            vert(vec3(-h.x, h.y, face_z), vec2(0.0, 1.0), white),
-            vert(vec3(h.x, h.y, face_z), vec2(1.0, 1.0), white),
-            vert(vec3(h.x, -h.y, face_z), vec2(1.0, 0.0), white),
-            vert(vec3(-h.x, -h.y, face_z), vec2(0.0, 0.0), white),
-        ];
-        draw_mesh(&Mesh { vertices: front, indices: vec![0, 1, 2, 0, 2, 3], texture: tape.face.as_ref().map(|rt| rt.texture.clone()) });
-
-        draw_recess(&m, h.z, face_z, 1.0, shade, &gloss, !mirror);
-
-        // Bevel highlight: a thin bright band just inside the front's rim,
-        // strongest at the top right corner and fading along the edges.
-        if !mirror {
-            let z = h.z + 0.003;
-            let rim = |p: Vec3, a: f32| {
-                let v = (255.0 * shade) as u8;
-                Vertex { position: m.transform_point3(p), uv: Vec2::ZERO, color: [v, v, v, (a * 255.0) as u8], normal: Vec4::ZERO }
-            };
-            let mut vertices = Vec::with_capacity(outline.len() * 2);
-            for &(p, n) in outline {
-                let g = glint(p, n) * SHEEN;
-                vertices.push(rim(p.extend(z), g));
-                vertices.push(rim((p - n * 0.035).extend(z), g * 0.15));
-            }
-            let mut indices = Vec::with_capacity(outline.len() * 6);
-            for k in 0..count {
-                let next = (k + 1) % count;
-                let (a0, b0, a1, b1) = (k * 2, k * 2 + 1, next * 2, next * 2 + 1);
-                indices.extend([a0, a1, b1, a0, b1, b0]);
-            }
-            draw_mesh(&Mesh { vertices, indices, texture: None });
-        }
-
-        // J-card on the back, seen once the tape is turned around.
-        if tape.flip > 0.3 && !mirror {
-            if let Some((_, _, rt)) = self.jcard.as_ref().filter(|(j, _, _)| *j == i) {
-                let z = JCARD_Z;
-                let back = vec![
-                    vert(vec3(h.x, h.y, z), vec2(0.0, 1.0), white),
-                    vert(vec3(-h.x, h.y, z), vec2(1.0, 1.0), white),
-                    vert(vec3(-h.x, -h.y, z), vec2(1.0, 0.0), white),
-                    vert(vec3(h.x, -h.y, z), vec2(0.0, 0.0), white),
-                ];
-                draw_mesh(&Mesh { vertices: back, indices: vec![0, 1, 2, 0, 2, 3], texture: Some(rt.texture.clone()) });
-                let mouse_row = (self.hover == Some(i)).then(|| self.jcard_row(lay, i, mouse_position().into())).flatten().map(|(_, r)| r);
-                let key_row = self.card_cursor.and_then(|c| {
-                    let range = gfx::jcard_range(self.albums[i].tracks.len(), self.jcard_page);
-                    range.contains(&c).then(|| gfx::jcard_rows(range.len())[c - range.start])
-                });
-                if self.flipped == Some(i)
-                    && let Some(row) = mouse_row.or(key_row)
-                {
-                    let corner = |x, y| Vertex {
-                        position: m.transform_point3(vec3(h.x - x / FACE_W * TAPE.x, h.y - y / FACE_H * TAPE.y, z - 0.002)),
-                        uv: Vec2::ZERO,
-                        color: [136, 49, 34, 34],
-                        normal: Vec4::ZERO,
-                    };
-                    let vertices = vec![corner(row.x, row.y), corner(row.right(), row.y), corner(row.right(), row.bottom()), corner(row.x, row.bottom())];
-                    draw_mesh(&Mesh { vertices, indices: vec![0, 1, 2, 0, 2, 3], texture: None });
+        match pass {
+            Pass::Solid => {
+                let mut vertices = Vec::with_capacity(outline.len() * 2 + 1);
+                let mut indices = Vec::with_capacity(outline.len() * 9);
+                for &(p, n) in outline {
+                    vertices.push(vert(p.extend(h.z), Vec2::ZERO, lit(p, n, true)));
+                    vertices.push(vert(p.extend(-h.z), Vec2::ZERO, lit(p, n, false)));
                 }
-                draw_recess(&m, -h.z, z, -1.0, shade, &|_| 1.0, true);
+                for k in 0..count {
+                    let (a0, b0) = (k * 2, k * 2 + 1);
+                    let (a1, b1) = (((k + 1) % count) * 2, ((k + 1) % count) * 2 + 1);
+                    indices.extend([a0, a1, b1, a0, b1, b0]);
+                }
+                // Back plate as a fan around the center; a turned tape shows its
+                // card through a clear back instead.
+                if !card {
+                    let center = vertices.len() as u16;
+                    vertices.push(vert(vec3(0.0, 0.0, -h.z), Vec2::ZERO, [14, 14, 14]));
+                    for k in 0..count {
+                        indices.extend([center, k * 2 + 1, ((k + 1) % count) * 2 + 1]);
+                    }
+                }
+                draw_mesh(&Mesh { vertices, indices, texture: None });
+                draw_recess(&m, h.z, face_z, 1.0, shade, &gloss, Recess::Walls);
+                if card {
+                    draw_recess(&m, -h.z, JCARD_Z, -1.0, shade, &|_| 1.0, Recess::Walls);
+                }
+            }
+            Pass::Edge => {
+                // Ridged top edge along the straight part of the shell.
+                let (r, y, top) = (gfx::FACE_RADIUS / FACE_W * TAPE.x, h.y + 0.002, [255, 255, 255]);
+                let edge = vec![
+                    vert(vec3(-h.x + r, y, h.z), vec2(0.0, 0.0), top),
+                    vert(vec3(h.x - r, y, h.z), vec2(1.0, 0.0), top),
+                    vert(vec3(h.x - r, y, -h.z), vec2(1.0, 1.0), top),
+                    vert(vec3(-h.x + r, y, -h.z), vec2(0.0, 1.0), top),
+                ];
+                draw_mesh(&Mesh { vertices: edge, indices: vec![0, 1, 2, 0, 2, 3], texture: Some(self.edge.clone()) });
+            }
+            Pass::Face => {
+                // The printed front sits inside the shell, under a clear plastic
+                // window that is flush with the rim.
+                let front = vec![
+                    vert(vec3(-h.x, h.y, face_z), vec2(0.0, 1.0), white),
+                    vert(vec3(h.x, h.y, face_z), vec2(1.0, 1.0), white),
+                    vert(vec3(h.x, -h.y, face_z), vec2(1.0, 0.0), white),
+                    vert(vec3(-h.x, -h.y, face_z), vec2(0.0, 0.0), white),
+                ];
+                draw_mesh(&Mesh { vertices: front, indices: vec![0, 1, 2, 0, 2, 3], texture: tape.face.as_ref().map(|rt| rt.texture.clone()) });
+                // J-card on the back, seen once the tape is turned around.
+                if card && let Some((_, _, rt)) = &self.jcard {
+                    let z = JCARD_Z;
+                    let back = vec![
+                        vert(vec3(h.x, h.y, z), vec2(0.0, 1.0), white),
+                        vert(vec3(-h.x, h.y, z), vec2(1.0, 1.0), white),
+                        vert(vec3(-h.x, -h.y, z), vec2(1.0, 0.0), white),
+                        vert(vec3(h.x, -h.y, z), vec2(0.0, 0.0), white),
+                    ];
+                    draw_mesh(&Mesh { vertices: back, indices: vec![0, 1, 2, 0, 2, 3], texture: Some(rt.texture.clone()) });
+                }
+            }
+            Pass::Clear => {
+                // The clear front, then a bevel highlight: a thin bright band just
+                // inside the rim, strongest at the top right corner and fading
+                // along the edges.
+                if !mirror {
+                    draw_recess(&m, h.z, face_z, 1.0, shade, &gloss, Recess::Glass);
+                    let z = h.z + 0.003;
+                    let rim = |p: Vec3, a: f32| {
+                        let v = (255.0 * shade) as u8;
+                        Vertex { position: m.transform_point3(p), uv: Vec2::ZERO, color: [v, v, v, (a * 255.0) as u8], normal: Vec4::ZERO }
+                    };
+                    let mut vertices = Vec::with_capacity(outline.len() * 2);
+                    for &(p, n) in outline {
+                        let g = glint(p, n) * SHEEN;
+                        vertices.push(rim(p.extend(z), g));
+                        vertices.push(rim((p - n * 0.035).extend(z), g * 0.15));
+                    }
+                    let mut indices = Vec::with_capacity(outline.len() * 6);
+                    for k in 0..count {
+                        let next = (k + 1) % count;
+                        let (a0, b0, a1, b1) = (k * 2, k * 2 + 1, next * 2, next * 2 + 1);
+                        indices.extend([a0, a1, b1, a0, b1, b0]);
+                    }
+                    draw_mesh(&Mesh { vertices, indices, texture: None });
+                }
+
+                // Highlighted track row and the clear back over a turned tape's card.
+                if card {
+                    let z = JCARD_Z;
+                    let mouse_row = (self.hover == Some(i)).then(|| self.jcard_row(lay, i, mouse_position().into())).flatten().map(|(_, r)| r);
+                    let key_row = self.card_cursor.and_then(|c| {
+                        let range = gfx::jcard_range(self.albums[i].tracks.len(), self.jcard_page);
+                        range.contains(&c).then(|| gfx::jcard_rows(range.len())[c - range.start])
+                    });
+                    if self.flipped == Some(i)
+                        && let Some(row) = mouse_row.or(key_row)
+                    {
+                        let corner = |x, y| Vertex {
+                            position: m.transform_point3(vec3(h.x - x / FACE_W * TAPE.x, h.y - y / FACE_H * TAPE.y, z - 0.002)),
+                            uv: Vec2::ZERO,
+                            color: [136, 49, 34, 34],
+                            normal: Vec4::ZERO,
+                        };
+                        let vertices = vec![corner(row.x, row.y), corner(row.right(), row.y), corner(row.right(), row.bottom()), corner(row.x, row.bottom())];
+                        draw_mesh(&Mesh { vertices, indices: vec![0, 1, 2, 0, 2, 3], texture: None });
+                    }
+                    draw_recess(&m, -h.z, z, -1.0, shade, &|_| 1.0, Recess::Glass);
+                }
             }
         }
     }
@@ -3230,12 +3263,10 @@ impl App {
                 f.draw(text, x, base, size, fade(color), true);
                 let lit = fill.clamp(0.0, width);
                 if !previewing && lit > 0.0 {
-                    let mut gl = unsafe { get_internal_gl() };
-                    gl.flush();
+                    let gl = unsafe { get_internal_gl() };
                     gl.quad_gl.scissor(Some((x as i32, (base - size) as i32, lit.ceil() as i32, (size * 1.4) as i32)));
                     f.draw(text, x, base, size, fade(self.accent), true);
-                    let mut gl = unsafe { get_internal_gl() };
-                    gl.flush();
+                    let gl = unsafe { get_internal_gl() };
                     gl.quad_gl.scissor(None);
                 }
                 fill -= width;
@@ -3440,8 +3471,7 @@ impl App {
         let searching = !self.query.is_empty();
         let focused = if searching { self.matches.get(self.focus).map(|m| m.0) } else { None };
         let clip = |on: bool| {
-            let mut gl = unsafe { get_internal_gl() };
-            gl.flush();
+            let gl = unsafe { get_internal_gl() };
             gl.quad_gl.scissor(on.then(|| (a.x as i32 - 4, a.y as i32, a.w as i32 + 8, a.h as i32)));
         };
         clip(true);
@@ -3898,15 +3928,25 @@ impl App {
     }
 
     /// Analog VU meter: cream dial, scale with a red zone, black needle.
-    fn draw_vu(&self, r: Rect, value: f32, channel: &str) {
+    /// The dial of a VU meter (with `value: None`), or its needle.
+    fn draw_vu(&self, r: Rect, value: Option<f32>, channel: &str) {
         let f = &self.fonts;
-        round_rect(r, R_BOX, Color::from_rgba(232, 224, 200, 255));
-        round_rect_lines(r, R_BOX, 1.0, Color::new(1.0, 1.0, 1.0, 0.5));
         let pivot = vec2(r.center().x, r.bottom() + r.h * 0.18);
         let radius = r.h * 0.92;
         let span = 0.95_f32; // radians either side of vertical
         let angle_of = |v: f32| -FRAC_PI_2 - span + v * 2.0 * span;
         let ink = Color::from_rgba(40, 36, 30, 255);
+        if let Some(value) = value {
+            let a = angle_of(value);
+            let tip = pivot + vec2(a.cos(), a.sin()) * radius * 0.97;
+            // The pivot sits below the dial; start the needle at the dial's edge.
+            let t = ((r.bottom() - 1.0 - pivot.y) / (tip.y - pivot.y)).clamp(0.0, 1.0);
+            let base = pivot + (tip - pivot) * t;
+            draw_line(base.x, base.y, tip.x, tip.y, 1.4, ink);
+            return;
+        }
+        round_rect(r, R_BOX, Color::from_rgba(232, 224, 200, 255));
+        round_rect_lines(r, R_BOX, 1.0, Color::new(1.0, 1.0, 1.0, 0.5));
         let red = Color::from_rgba(196, 52, 40, 255);
         // Scale arc: black up to 0 VU, red beyond.
         gfx::arc(pivot.x, pivot.y, radius * 0.86, angle_of(0.0), angle_of(0.87) - angle_of(0.0), 1.2, ink);
@@ -3922,15 +3962,23 @@ impl App {
         }
         f.draw("VU", r.center().x - f.width("VU", 9.0, true) / 2.0, r.bottom() - 6.0, 9.0, ink, true);
         f.draw(channel, r.x + 5.0, r.bottom() - 5.0, 8.0, ink, true);
-        let a = angle_of(value);
-        let tip = pivot + vec2(a.cos(), a.sin()) * radius * 0.97;
-        // The pivot sits below the dial; start the needle at the dial's edge.
-        let t = ((r.bottom() - 1.0 - pivot.y) / (tip.y - pivot.y)).clamp(0.0, 1.0);
-        let base = pivot + (tip - pivot) * t;
-        draw_line(base.x, base.y, tip.x, tip.y, 1.4, ink);
     }
 
-    fn draw_deck(&self, lay: &Layout) {
+    /// Rectangles of the two VU meters, between the speaker and the knob.
+    fn vu_rects(lay: &Layout) -> [Rect; 2] {
+        let left_edge = lay.grille.x + GRILLE_R + SP_S;
+        // The knob's end stops and pointer reach a few pixels past its radius.
+        let right_edge = lay.knob.x - KNOB_R - 4.0 - SP_S;
+        let w = ((right_edge - left_edge - SP_S) / 2.0).min(84.0);
+        let h = 56.0;
+        let top = lay.grille.y - h / 2.0;
+        [0.0, 1.0].map(|k| Rect::new((left_edge + right_edge) / 2.0 - w - SP_S / 2.0 + k * (w + SP_S), top, w, h))
+    }
+
+    /// Everything on the deck that does not move: body, speaker plate, meter
+    /// dials, knob scale, the frames of the door, LCD and keys, and the print.
+    /// Drawn once into a texture; see `draw_deck`.
+    fn draw_deck_body(&self, lay: &Layout) {
         let d = lay.deck;
         let f = &self.fonts;
 
@@ -3948,11 +3996,76 @@ impl App {
         draw_rectangle(d.x + R_PANEL, d.bottom() - 2.0, d.w - 2.0 * R_PANEL, 1.0, Color::new(0.0, 0.0, 0.0, 0.5));
         round_rect_lines(d, R_PANEL, 1.5, LINE);
 
-        // Speaker: a perforated square, its holes swelling with the music.
+        // Speaker plate; its holes are drawn live.
         let g = lay.grille;
         let grille = Rect::new(g.x - GRILLE_R, g.y - GRILLE_R, 2.0 * GRILLE_R, 2.0 * GRILLE_R);
         round_rect(grille, R_BOX, Color::new(0.0, 0.0, 0.0, 0.35));
         round_rect_lines(grille, R_BOX, 1.0, Color::new(1.0, 1.0, 1.0, 0.18));
+
+        for (r, name) in Self::vu_rects(lay).into_iter().zip(["L", "R"]) {
+            self.draw_vu(r, None, name);
+        }
+
+        // Volume knob: an open ring from 0 (bottom left) to 100 (bottom right).
+        let k = lay.knob;
+        let rad = KNOB_R - 3.0;
+        draw_circle(k.x, k.y, rad - 4.0, Color::new(0.0, 0.0, 0.0, 0.3));
+        gfx::arc(k.x, k.y, rad, knob_angle(0.0), 1.5 * PI, 3.0, Color::new(1.0, 1.0, 1.0, 0.22));
+        // Stops at both ends of the travel.
+        for v in [0.0, 1.0] {
+            let dir = vec2(knob_angle(v).cos(), knob_angle(v).sin());
+            let (p0, p1) = (k + dir * (rad - 5.0), k + dir * (rad + 4.0));
+            draw_line(p0.x, p0.y, p1.x, p1.y, 1.5, INK);
+        }
+
+        // Cassette door: a recessed compartment, and the print below it.
+        let s = lay.slot;
+        round_rect(Rect::new(s.x - 2.0, s.y - 2.0, s.w + 4.0, s.h + 4.0), R_BOX + 2.0, Color::new(0.0, 0.0, 0.0, 0.45));
+        round_rect(s, R_BOX, Color::from_rgba(14, 15, 17, 255));
+        let print = "AUTO STOP  ·  NORMAL BIAS  120µs EQ";
+        f.draw(print, s.x + 12.0, s.bottom() - 6.0, 8.0, Color::new(1.0, 1.0, 1.0, 0.4), false);
+
+        // The LCD set into the body.
+        let dp = lay.display;
+        round_rect(Rect::new(dp.x - 2.0, dp.y - 2.0, dp.w + 4.0, dp.h + 4.0), R_BOX + 2.0, Color::new(0.0, 0.0, 0.0, 0.45));
+        round_rect(dp, R_BOX, LCD);
+        draw_rectangle(dp.x + 4.0, dp.y + 2.0, dp.w - 8.0, 1.0, Color::new(1.0, 1.0, 1.0, 0.06));
+        round_rect_lines(dp, R_BOX, 1.0, Color::new(1.0, 1.0, 1.0, 0.2));
+
+        // Key slots, with the keys' names printed on the body above them.
+        for (key, name) in lay.keys.iter().zip(["REW", "PLAY", "FF", "EJECT"]) {
+            f.draw(name, key.center().x - f.width(name, 9.0, true) / 2.0, key.y - 6.0, 9.0, Color::new(1.0, 1.0, 1.0, 0.75), true);
+            round_rect(Rect::new(key.x - 1.0, key.y - 1.0, key.w + 2.0, key.h + 2.0), R_CHIP + 1.0, Color::new(0.0, 0.0, 0.0, 0.6));
+        }
+    }
+
+    fn draw_deck(&self, lay: &Layout) {
+        let d = lay.deck;
+        let f = &self.fonts;
+
+        // The still parts come from a texture painted once per deck size:
+        // drawn live they cost hundreds of draw calls a frame.
+        let mut cache = self.deck_cache.borrow_mut();
+        if cache.as_ref().is_none_or(|(r, _)| *r != d) {
+            let rt = render_target_ex(d.w as u32, d.h as u32, RenderTargetParams { sample_count: CANVAS_SAMPLES, depth: false });
+            rt.texture.set_filter(FilterMode::Nearest);
+            let mut cam = Camera2D::from_display_rect(d);
+            cam.render_target = Some(rt.clone());
+            set_camera(&cam);
+            clear_background(Color::new(0.0, 0.0, 0.0, 0.0));
+            self.draw_deck_body(lay);
+            set_camera(&self.ui_camera());
+            *cache = Some((d, rt));
+        }
+        if let Some((_, rt)) = cache.as_ref() {
+            let params = DrawTextureParams { dest_size: Some(d.size()), flip_y: true, ..Default::default() };
+            draw_texture_ex(&rt.texture, d.x, d.y, WHITE, params);
+        }
+        drop(cache);
+
+        // Speaker holes, swelling with the music.
+        let g = lay.grille;
+        let grille = Rect::new(g.x - GRILLE_R, g.y - GRILLE_R, 2.0 * GRILLE_R, 2.0 * GRILLE_R);
         let hole = 1.5 + self.level * 0.6;
         let step = 6.5;
         let n = ((grille.w - 8.0) / step).floor() as i32;
@@ -3963,47 +4076,25 @@ impl App {
             }
         }
 
-        // Stereo VU meters between the speaker and the knob.
-        let left_edge = lay.grille.x + GRILLE_R + SP_S;
-        // The knob's end stops and pointer reach a few pixels past its radius.
-        let right_edge = lay.knob.x - KNOB_R - 4.0 - SP_S;
-        let w = ((right_edge - left_edge - SP_S) / 2.0).min(84.0);
-        let h = 56.0;
-        let top = lay.grille.y - h / 2.0;
-        for (k, (value, name)) in [(self.vu.0, "L"), (self.vu.1, "R")].into_iter().enumerate() {
-            let x = (left_edge + right_edge) / 2.0 - w - SP_S / 2.0 + k as f32 * (w + SP_S);
-            self.draw_vu(Rect::new(x, top, w, h), value, name);
+        for (r, value) in Self::vu_rects(lay).into_iter().zip([self.vu.0, self.vu.1]) {
+            self.draw_vu(r, Some(value), "");
         }
 
-        // Volume knob: an open ring from 0 (bottom left) to 100 (bottom right),
-        // filled up to the current level, with the level in the middle.
+        // The knob's level: the filled part of the ring, its pointer and number.
         let k = lay.knob;
-        let angle_of = |v: f32| (-135.0 + v * 270.0).to_radians() - FRAC_PI_2;
-        let sweep = 1.5 * PI;
         let rad = KNOB_R - 3.0;
-        draw_circle(k.x, k.y, rad - 4.0, Color::new(0.0, 0.0, 0.0, 0.3));
-        gfx::arc(k.x, k.y, rad, angle_of(0.0), sweep, 3.0, Color::new(1.0, 1.0, 1.0, 0.22));
-        gfx::arc(k.x, k.y, rad, angle_of(0.0), sweep * self.volume, 3.0, INK);
-        // Stops at both ends of the travel.
-        for v in [0.0, 1.0] {
-            let dir = vec2(angle_of(v).cos(), angle_of(v).sin());
-            let (p0, p1) = (k + dir * (rad - 5.0), k + dir * (rad + 4.0));
-            draw_line(p0.x, p0.y, p1.x, p1.y, 1.5, INK);
-        }
-        let dir = vec2(angle_of(self.volume).cos(), angle_of(self.volume).sin());
+        gfx::arc(k.x, k.y, rad, knob_angle(0.0), 1.5 * PI * self.volume, 3.0, INK);
+        let dir = vec2(knob_angle(self.volume).cos(), knob_angle(self.volume).sin());
         let tip = k + dir * rad;
         draw_circle(tip.x, tip.y, 4.0, INK);
         draw_circle(tip.x, tip.y, 1.5, BLACK);
         let level = format!("{}", (self.volume * 100.0).round() as u32);
         f.draw(&level, k.x - f.width(&level, 11.0, true) / 2.0, k.y + 4.0, 11.0, INK, true);
 
-        // Cassette door: a recessed compartment behind smoked glass.
+        // The cassette bay behind the door's smoked glass.
         let s = lay.slot;
-        round_rect(Rect::new(s.x - 2.0, s.y - 2.0, s.w + 4.0, s.h + 4.0), R_BOX + 2.0, Color::new(0.0, 0.0, 0.0, 0.45));
-        round_rect(s, R_BOX, Color::from_rgba(14, 15, 17, 255));
         let bay = Rect::new(s.x + 10.0, s.y + 8.0, s.w - 20.0, s.h - 26.0);
-        let mut gl = unsafe { get_internal_gl() };
-        gl.flush();
+        let gl = unsafe { get_internal_gl() };
         gl.quad_gl.scissor(Some((bay.x as i32, bay.y as i32, bay.w as i32, bay.h as i32)));
         match self.current {
             None => {
@@ -4021,8 +4112,7 @@ impl App {
                 self.draw_deck_cassette(mini, i);
             }
         }
-        let mut gl = unsafe { get_internal_gl() };
-        gl.flush();
+        let gl = unsafe { get_internal_gl() };
         gl.quad_gl.scissor(None);
         // Glass: a little smoke and a diagonal glint, then the frame.
         draw_rectangle(bay.x, bay.y, bay.w, bay.h, Color::new(0.05, 0.06, 0.07, 0.18));
@@ -4031,8 +4121,6 @@ impl App {
         draw_triangle(vec2(bay.x + bay.w * 0.12, bay.bottom()), vec2(bay.x + bay.w * 0.3, bay.y), vec2(bay.x + bay.w * 0.24, bay.bottom()), glint);
         round_rect_lines(bay, 3.0, 1.0, Color::new(1.0, 1.0, 1.0, 0.16));
         round_rect_lines(s, R_BOX, 1.0, Color::new(1.0, 1.0, 1.0, 0.22));
-        let print = "AUTO STOP  ·  NORMAL BIAS  120µs EQ";
-        f.draw(print, s.x + 12.0, s.bottom() - 6.0, 8.0, Color::new(1.0, 1.0, 1.0, 0.4), false);
         // Sticker on the door's corner while a hi-res track plays.
         if let Some(i) = self.current
             && self.albums[i].tracks.get(self.track).is_some_and(|t| t.hires)
@@ -4043,18 +4131,14 @@ impl App {
             f.draw("HI-RES", tag.x + 6.0, tag.y + 10.5, 9.0, BLACK, true);
         }
 
-        // Piano keys, labelled on the body above them. Play stays latched
-        // down while the tape runs; the others spring back.
+        // Piano key caps. Play stays latched down while the tape runs; the
+        // others spring back.
         let now = get_time();
         let playing = self.audio.is_playing();
         for (k, key) in lay.keys.iter().enumerate() {
-            let name = ["REW", "PLAY", "FF", "EJECT"][k];
-            f.draw(name, key.center().x - f.width(name, 9.0, true) / 2.0, key.y - 6.0, 9.0, Color::new(1.0, 1.0, 1.0, 0.75), true);
             let latched = k == 1 && playing;
             let tapped = now - self.pressed[k] < 0.12;
             let sink = if latched { 5.0 } else if tapped { 3.0 } else { 0.0 };
-            // The slot the key moves in, then the key cap.
-            round_rect(Rect::new(key.x - 1.0, key.y - 1.0, key.w + 2.0, key.h + 2.0), R_CHIP + 1.0, Color::new(0.0, 0.0, 0.0, 0.6));
             let cap = Rect::new(key.x, key.y + sink, key.w, key.h - sink);
             let base = if k == 1 { Color { a: 1.0, ..self.accent } } else { KEY };
             let shade = if latched { 0.8 } else { 1.0 };
@@ -4093,11 +4177,6 @@ impl App {
 
         // Display: track, time, progress, current lyric.
         let dp = lay.display;
-        // An LCD set into the body.
-        round_rect(Rect::new(dp.x - 2.0, dp.y - 2.0, dp.w + 4.0, dp.h + 4.0), R_BOX + 2.0, Color::new(0.0, 0.0, 0.0, 0.45));
-        round_rect(dp, R_BOX, LCD);
-        draw_rectangle(dp.x + 4.0, dp.y + 2.0, dp.w - 8.0, 1.0, Color::new(1.0, 1.0, 1.0, 0.06));
-        round_rect_lines(dp, R_BOX, 1.0, Color::new(1.0, 1.0, 1.0, 0.2));
         let dur = self.duration().map(|d| d.as_secs_f32()).filter(|&d| d > 0.0);
         let pos = match (self.seek_drag, dur) {
             (Some(f), Some(d)) => f * d,
@@ -4126,13 +4205,11 @@ impl App {
             let cycle = (lw + GAP) / SPEED + 1.5;
             let t = (get_time() as f32 % cycle - 1.5).max(0.0);
             let x = label_x - t * SPEED;
-            let mut gl = unsafe { get_internal_gl() };
-            gl.flush();
+            let gl = unsafe { get_internal_gl() };
             gl.quad_gl.scissor(Some((label_x as i32, dp.y as i32 + 2, room as i32, 16)));
             f.draw(&label, x, dp.y + 13.0, 11.0, INK, false);
             f.draw(&label, x + lw + GAP, dp.y + 13.0, 11.0, INK, false);
-            let mut gl = unsafe { get_internal_gl() };
-            gl.flush();
+            let gl = unsafe { get_internal_gl() };
             gl.quad_gl.scissor(None);
         }
         // Elapsed on the left, time left on the right, around the progress bar.
@@ -4182,11 +4259,11 @@ impl App {
     }
 }
 
-/// The window over a printed side of a tape: walls down from the rim at
-/// `surface` to the print at `inner`, then, with `glass`, a clear sheet
-/// flush with the rim with a little smoke and two diagonal reflections.
+/// The window over a printed side of a tape: the walls down from the rim at
+/// `surface` to the print at `inner`, or the clear sheet flush with the rim,
+/// with a little smoke and two diagonal reflections.
 /// `side` is +1 for the front and -1 for the back, which faces the other way.
-fn draw_recess(m: &Mat4, surface: f32, inner: f32, side: f32, shade: f32, gloss: &dyn Fn(Vec3) -> f32, glass: bool) {
+fn draw_recess(m: &Mat4, surface: f32, inner: f32, side: f32, shade: f32, gloss: &dyn Fn(Vec3) -> f32, part: Recess) {
     let outline = shell_outline();
     let h = TAPE / 2.0;
     let count = outline.len() as u16;
@@ -4205,16 +4282,16 @@ fn draw_recess(m: &Mat4, surface: f32, inner: f32, side: f32, shade: f32, gloss:
     };
 
     // Walls, seen at an angle between rim and print.
-    let mut vertices = Vec::with_capacity(outline.len() * 2);
-    for &(p, n) in outline {
-        let wall = p - n * 0.01;
-        let v = 22.0 + 30.0 * (1.0 - (n.y + 1.0) / 2.0);
-        vertices.push(point(wall.extend(surface), v, 1.0));
-        vertices.push(point(wall.extend(inner), v * 0.6, 1.0));
-    }
-    let indices = band(&vertices);
-    draw_mesh(&Mesh { vertices, indices, texture: None });
-    if !glass {
+    if part == Recess::Walls {
+        let mut vertices = Vec::with_capacity(outline.len() * 2);
+        for &(p, n) in outline {
+            let wall = p - n * 0.01;
+            let v = 22.0 + 30.0 * (1.0 - (n.y + 1.0) / 2.0);
+            vertices.push(point(wall.extend(surface), v, 1.0));
+            vertices.push(point(wall.extend(inner), v * 0.6, 1.0));
+        }
+        let indices = band(&vertices);
+        draw_mesh(&Mesh { vertices, indices, texture: None });
         return;
     }
 
@@ -4243,6 +4320,22 @@ fn draw_recess(m: &Mat4, surface: f32, inner: f32, side: f32, shade: f32, gloss:
         }
     }
     draw_mesh(&Mesh { vertices, indices, texture: None });
+}
+
+/// Which part of the tapes a stage pass draws; see `draw_stage`.
+#[derive(Clone, Copy, PartialEq)]
+enum Pass {
+    Solid,
+    Edge,
+    Face,
+    Clear,
+}
+
+/// The opaque walls of a window's recess, or the clear sheet over it.
+#[derive(Clone, Copy, PartialEq)]
+enum Recess {
+    Walls,
+    Glass,
 }
 
 /// Rounded-rectangle outline of the tape front, counter-clockwise, as

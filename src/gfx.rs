@@ -19,15 +19,58 @@ pub fn filter_tape_texture(texture: &Texture2D) {
     }
 }
 
+/// FxHash: a fast, non-cryptographic hash for the font caches, which are
+/// looked up for every character drawn every frame.
+#[derive(Default)]
+struct Fx(u64);
+
+impl Fx {
+    fn add(&mut self, x: u64) {
+        self.0 = (self.0.rotate_left(5) ^ x).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl std::hash::Hasher for Fx {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.add(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        for &b in chunks.remainder() {
+            self.add(b as u64);
+        }
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.add(x);
+    }
+    fn write_u32(&mut self, x: u32) {
+        self.add(x as u64);
+    }
+    fn write_u16(&mut self, x: u16) {
+        self.add(x as u64);
+    }
+    fn write_u8(&mut self, x: u8) {
+        self.add(x as u64);
+    }
+    fn write_usize(&mut self, x: usize) {
+        self.add(x as u64);
+    }
+}
+
+type FxBuild = std::hash::BuildHasherDefault<Fx>;
+
 pub struct Fonts {
     regular: Option<Font>,
     bold: Option<Font>,
     cjk: Option<Font>,
     /// Glyphs known to be in a font's atlas, by font address, character and size.
-    cached: std::cell::RefCell<std::collections::HashSet<(usize, char, u16)>>,
+    cached: std::cell::RefCell<std::collections::HashSet<(usize, char, u16), FxBuild>>,
     /// Measured widths by a hash of text, size and weight: the same labels
     /// are measured every frame, and measuring walks every glyph.
-    widths: std::cell::RefCell<std::collections::HashMap<u64, f32>>,
+    widths: std::cell::RefCell<std::collections::HashMap<u64, f32, FxBuild>>,
 }
 
 fn system_font(pattern: &str) -> Option<Font> {
@@ -50,9 +93,11 @@ impl Fonts {
     }
 
     /// Puts any glyph of `text` that is not cached yet into the font's atlas,
-    /// after drawing what is queued. A new glyph can make the atlas grow,
-    /// which repacks every glyph and replaces its texture: text already
-    /// queued in the frame would then sample the wrong places.
+    /// after sending what is queued to the GPU. A new glyph can make the
+    /// atlas grow, which repacks every glyph and replaces its texture: text
+    /// still queued from earlier in the frame would then sample the wrong
+    /// places. Popping a pushed camera state submits the queue and leaves the
+    /// camera as it was.
     fn prepare(&self, font: Option<&Font>, text: &str, size: u16) {
         let Some(font) = font else { return };
         let id = font as *const Font as usize;
@@ -61,8 +106,8 @@ impl Fonts {
         if missing.is_empty() {
             return;
         }
-        let mut gl = unsafe { get_internal_gl() };
-        gl.flush();
+        push_camera_state();
+        pop_camera_state();
         font.populate_font_cache(&missing, size);
         cached.extend(missing.into_iter().map(|c| (id, c, size)));
     }
@@ -78,7 +123,7 @@ impl Fonts {
 
     pub fn width(&self, text: &str, size: f32, bold: bool) -> f32 {
         use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = Fx::default();
         (text, size as u16, bold).hash(&mut h);
         let key = h.finish();
         if let Some(&w) = self.widths.borrow().get(&key) {
@@ -465,14 +510,12 @@ pub fn render_face(
     round_rect(win, 39.0, Color::from_rgba(16, 16, 19, 255));
     let (lc, rc) = (vec2(win.x + 50.0, win.center().y), vec2(win.right() - 50.0, win.center().y));
     let (left, right) = (19.0 + 17.0 * wound, 19.0 + 17.0 * (1.0 - wound));
-    let mut gl = unsafe { get_internal_gl() };
-    gl.flush();
+    let gl = unsafe { get_internal_gl() };
     gl.quad_gl.scissor(Some((win.x as i32, win.y as i32, win.w as i32, win.h as i32)));
     window_reel(lc, left, 0.4 + wound);
     window_reel(rc, right, 1.3 - wound);
     draw_line(lc.x, lc.y + left, rc.x, rc.y + right, 2.0, Color::from_rgba(58, 40, 26, 255));
-    let mut gl = unsafe { get_internal_gl() };
-    gl.flush();
+    let gl = unsafe { get_internal_gl() };
     gl.quad_gl.scissor(None);
     // Guide rollers at the window's lower corners.
     for x in [win.x + 22.0, win.right() - 22.0] {
@@ -710,8 +753,7 @@ pub fn winding_window(win: Rect, progress: f32, angles: (f32, f32)) {
     let hub = Color::from_rgba(11, 11, 11, 255);
     round_rect(win, win.h / 2.0, hub);
     let (lc, rc) = (vec2(win.x + win.h * 0.62, win.center().y), vec2(win.right() - win.h * 0.62, win.center().y));
-    let mut gl = unsafe { get_internal_gl() };
-    gl.flush();
+    let gl = unsafe { get_internal_gl() };
     gl.quad_gl.scissor(Some((win.x as i32, win.y as i32, win.w as i32, win.h as i32)));
     let brown = Color::from_rgba(78, 54, 34, 255);
     draw_circle(lc.x, lc.y, left, brown);
@@ -720,8 +762,7 @@ pub fn winding_window(win: Rect, progress: f32, angles: (f32, f32)) {
     draw_line(lc.x, lc.y + left, rc.x, rc.y + right, 1.5, brown);
     reel(lc.x, lc.y, r_hub + 1.5, angles.0, hub);
     reel(rc.x, rc.y, r_hub + 1.5, angles.1, hub);
-    let mut gl = unsafe { get_internal_gl() };
-    gl.flush();
+    let gl = unsafe { get_internal_gl() };
     gl.quad_gl.scissor(None);
     round_rect_lines(win, win.h / 2.0, 1.0, Color::new(1.0, 1.0, 1.0, 0.3));
 }
