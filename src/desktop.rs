@@ -39,6 +39,11 @@ impl Desktop {
         Self { controls, events, shown: None, state: None }
     }
 
+    /// A player that stays off the bus, for when the setting is off.
+    pub fn off() -> Self {
+        Self { controls: None, events: channel().1, shown: None, state: None }
+    }
+
     /// Requests from the desktop since the last call.
     pub fn events(&self) -> Vec<MediaControlEvent> {
         self.events.try_iter().collect()

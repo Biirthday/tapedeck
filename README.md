@@ -53,7 +53,10 @@ time, genre) under the tracklist, and the deck has stereo VU meters. Fonts are t
 
 ## Controls
 
-Press `?` for the shortcut sheet.
+Press `?` for the shortcut sheet and `Ctrl+,` for the settings: volume, seek
+step, sound effects, MPRIS, view, sort, fullscreen, cover colors, reflections
+and cover light, animation and lyrics pace, key repeat, frame rates, rescanning
+and the control hints. Settings are saved with the rest of the state.
 
 - Wheel / drag / Left and Right: move along the rail (hold an arrow to keep going)
 - Up / Down: previous / next track of the tape in the deck; on a turned tape,

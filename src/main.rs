@@ -4,6 +4,7 @@ mod desktop;
 mod gfx;
 mod library;
 mod mixtape;
+mod settings;
 
 use std::f32::consts::{FRAC_PI_2, PI};
 use std::collections::{HashMap, VecDeque};
@@ -23,6 +24,7 @@ use desktop::{Desktop, MediaControlEvent, NowPlaying, SeekDirection};
 use gfx::{DIM, FACE_H, FACE_W, FaceStyle, Fonts, INK, LINE, cover_fit, ring, round_rect, round_rect_lines};
 use library::{Album, BLUR_SIZE, Cover, LyricLine, Lyrics};
 use mixtape::Mixtape;
+use settings::Settings;
 
 // Rail geometry in world units (1 unit = 100 px on the perspective plane).
 const STEP: Vec3 = vec3(0.82, 0.44, -1.3);
@@ -36,26 +38,19 @@ const VISIBLE: (f32, f32) = (-2.6, 17.0);
 const FAR_FADE: f32 = 10.0;
 /// Width the view and sort switches take in the stage's top right corner.
 const SWITCHES_W: f32 = 460.0;
-/// Strength of the cover-colored light at its source in the stage's corner.
-const GLOW: f32 = 0.2;
 /// Direction the key light comes from, on the tape's face plane, and how
 /// bright the metallic rim it catches is.
 const SHEEN_DIR: Vec2 = vec2(0.55, 0.835);
 const SHEEN: f32 = 0.85;
-/// How deep the printed front sits under the clear window, and how that
-/// window looks: a little smoke, and the brightness of its reflections.
+/// How deep the printed front sits under the clear window.
 const RECESS: f32 = 0.07;
 /// Depth of the printed card behind a turned tape's clear back.
 const JCARD_Z: f32 = -TAPE.z / 2.0 + RECESS;
+/// Smoke tint of the tapes' clear plastic.
 const GLASS_SMOKE: f32 = 0.12;
-const GLASS_SHEEN: f32 = 0.22;
-/// Brightness of the floor reflection right under a tape.
-const REFLECTION: f32 = 0.28;
-/// Seconds `[` and `]` (and media seek events) skip within a track.
-const SEEK_STEP: f32 = 10.0;
-/// Autorepeat for held keys: wait before the first repeat, then the interval.
-const REPEAT_DELAY: f64 = 0.35;
-const REPEAT_EVERY: f64 = 0.07;
+/// How far back towards the rail (in its 1..0 return) a tape must be before
+/// the tape replacing it may leave.
+const SWAP_CLEAR: f32 = 0.5;
 /// Seconds for a chosen tape to leave the rail for the deck (or come back).
 const LOAD_TIME: f32 = 1.1;
 /// Seconds to turn a tape around (or back).
@@ -343,6 +338,8 @@ struct Saved {
     /// The side list showed the queue instead of the tracklist.
     #[serde(default)]
     show_queue: bool,
+    #[serde(default)]
+    settings: Settings,
 }
 
 const LEARNED_LISTEN: u8 = 1;
@@ -565,6 +562,13 @@ struct App {
     plays: HashMap<String, u32>,
     played_at: HashMap<String, u64>,
     learned: u8,
+    settings: Settings,
+    /// The settings panel is open, which row is selected, and its scroll.
+    show_settings: bool,
+    settings_row: usize,
+    settings_scroll: f32,
+    /// The volume slider in the panel is being dragged.
+    settings_drag: bool,
     /// Mechanical deck noises on key presses, loading and ejecting.
     sfx: bool,
     view: View,
@@ -740,6 +744,11 @@ impl App {
             plays: saved.plays,
             played_at: saved.played_at,
             learned: saved.learned,
+            settings: saved.settings,
+            show_settings: false,
+            settings_row: 0,
+            settings_scroll: 0.0,
+            settings_drag: false,
             sfx: !saved.quiet,
             view: saved.view,
             grid_scroll: 0.0,
@@ -785,7 +794,7 @@ impl App {
             volume_at: f64::MIN,
             // The tape in front starts out selected, as it was left.
             key_focus: true,
-            desktop: Desktop::new(),
+            desktop: if saved.settings.mpris { Desktop::new() } else { Desktop::off() },
             desktop_art: None,
             last_position: 0.0,
             show_help: false,
@@ -1119,6 +1128,7 @@ impl App {
             quiet: !self.sfx,
             grid_top: self.grid_top(),
             show_queue: self.show_queue,
+            settings: self.settings,
         };
         if let Some(path) = state_path() {
             let _ = std::fs::create_dir_all(path.parent().unwrap());
@@ -1127,6 +1137,20 @@ impl App {
                 let _ = std::fs::rename(tmp, path);
             }
         }
+    }
+
+    /// Scans the music folder again in the background; `tick` applies the result.
+    fn start_rescan(&mut self) {
+        if self.rescan.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = self.music_root.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(library::scan(&root));
+        });
+        self.rescan = Some(rx);
+        self.toast = Some(("SCANNING THE MUSIC FOLDER".into(), get_time()));
     }
 
     /// Brings the rail in line with the music folder after a rescan: tapes
@@ -1632,10 +1656,15 @@ impl App {
 
         // Loading: the tape is pulled up out of the rail, comes forward
         // facing the viewer for a beat, then flies off the stage's lower left
-        // edge into the deck. Returning it plays the same path backwards.
-        let pull = ease(t.out / 0.25);
-        let present = ease((t.out - 0.15) / 0.4);
-        let fly = ((t.out - 0.58) / 0.42).clamp(0.0, 1.0).powi(3);
+        // edge into the deck. A tape coming back skips the presentation, which
+        // belongs to the tape replacing it: it flies in, slowing down, and
+        // drops straight into its place.
+        let returning = self.current != Some(i);
+        let (pull, present, fly) = if returning {
+            (ease(t.out / 0.45), 0.0, ease((t.out - 0.45) / 0.55))
+        } else {
+            (ease(t.out / 0.25), ease((t.out - 0.15) / 0.4), ((t.out - 0.58) / 0.42).clamp(0.0, 1.0).powi(3))
+        };
         let pulled = rail + vec3(0.0, 1.5, 0.5);
         let shown = at(0.36, 0.48, 3.6);
         let gone = at(-0.3, 0.92, 2.4);
@@ -1740,6 +1769,17 @@ impl App {
             self.active_at = get_time();
         }
         self.frame_mouse = mouse;
+        // Ctrl+, opens the settings, which then take all input.
+        let ctrl = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
+        if self.show_settings {
+            self.input_settings();
+            return;
+        }
+        if ctrl && is_key_pressed(KeyCode::Comma) {
+            self.open_settings(true);
+            while get_char_pressed().is_some() {}
+            return;
+        }
 
         let grid = self.grid(lay);
         // A resize changes columns and row height: keep the same album at
@@ -2075,18 +2115,8 @@ impl App {
         }
 
         // Keyboard.
-        if is_key_pressed(KeyCode::F5) && self.rescan.is_none() {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let root = self.music_root.clone();
-            std::thread::spawn(move || {
-                let _ = tx.send(library::scan(&root));
-            });
-            self.rescan = Some(rx);
-            self.toast = Some(("SCANNING THE MUSIC FOLDER".into(), get_time()));
-        }
-        if let Some(scanned) = self.rescan.as_ref().and_then(|rx| rx.try_recv().ok()) {
-            self.rescan = None;
-            self.apply_rescan(scanned);
+        if is_key_pressed(KeyCode::F5) {
+            self.start_rescan();
         }
         if is_key_pressed(KeyCode::F11) {
             self.fullscreen = !self.fullscreen;
@@ -2144,7 +2174,8 @@ impl App {
             }
             let (back, ahead) = (self.repeat(KeyCode::LeftBracket), self.repeat(KeyCode::RightBracket));
             if back || ahead {
-                self.seek_by(if ahead { SEEK_STEP } else { -SEEK_STEP });
+                let step = self.settings.seek_step();
+                self.seek_by(if ahead { step } else { -step });
             }
             // Home brings the playing tape into view.
             if is_key_pressed(KeyCode::Home)
@@ -2193,7 +2224,10 @@ impl App {
                 MediaControlEvent::Toggle => self.toggle(),
                 MediaControlEvent::Next => self.press(2),
                 MediaControlEvent::Previous => self.press(0),
-                MediaControlEvent::Seek(dir) => self.seek_by(if dir == SeekDirection::Forward { SEEK_STEP } else { -SEEK_STEP }),
+                MediaControlEvent::Seek(dir) => {
+                    let step = self.settings.seek_step();
+                    self.seek_by(if dir == SeekDirection::Forward { step } else { -step })
+                }
                 MediaControlEvent::SeekBy(dir, by) => {
                     let by = by.as_secs_f32();
                     self.seek_by(if dir == SeekDirection::Forward { by } else { -by });
@@ -2268,9 +2302,9 @@ impl App {
         if busy {
             0.0
         } else if self.audio.is_playing() {
-            1.0 / 30.0
+            self.settings.playing_frame()
         } else {
-            1.0 / 12.0
+            self.settings.idle_frame()
         }
     }
 
@@ -2309,12 +2343,13 @@ impl App {
         }
     }
 
-    /// True when `key` was just pressed, and again every REPEAT_EVERY seconds
-    /// once it has been held for REPEAT_DELAY.
+    /// True when `key` was just pressed, and again at the key repeat interval
+    /// once it has been held for the repeat delay (both from the settings).
     fn repeat(&mut self, key: KeyCode) -> bool {
         let now = get_time();
+        let (delay, every) = self.settings.key_repeat();
         if is_key_pressed(key) {
-            self.held = Some((key, now + REPEAT_DELAY));
+            self.held = Some((key, now + delay));
             return true;
         }
         match self.held {
@@ -2323,7 +2358,7 @@ impl App {
                 false
             }
             Some((held, at)) if held == key && now >= at => {
-                self.held = Some((key, now + REPEAT_EVERY));
+                self.held = Some((key, now + every));
                 true
             }
             _ => false,
@@ -2616,6 +2651,11 @@ impl App {
         let searching = !self.query.is_empty();
         let focused_idx = if searching { self.matches.get(self.focus).map(|m| m.0) } else { None };
         let mut moving = false;
+        let motion = self.settings.motion();
+        // A new tape waits until the one it replaces has come back onto the
+        // stage and is past the spot where the new one will be shown.
+        let current = self.current;
+        let returning = self.tapes.iter().enumerate().any(|(j, t)| current != Some(j) && t.out > SWAP_CLEAR);
         for (i, tape) in self.tapes.iter_mut().enumerate() {
             let matched = searching && tape.matched;
             let goal = if Some(i) == self.hover || focused_idx == Some(i) {
@@ -2630,15 +2670,19 @@ impl App {
                 tape.lift += (goal - tape.lift) * k;
                 tape.dim += (dim - tape.dim) * k;
             }
-            let out = if self.current == Some(i) { 1.0 } else { 0.0 };
+            let out = match current == Some(i) {
+                true if returning => tape.out,
+                true => 1.0,
+                false => 0.0,
+            };
             let flip = if self.flipped == Some(i) { 1.0 } else { 0.0 };
             moving |= (tape.lift - goal).abs() > 0.002 || (tape.dim - dim).abs() > 0.002 || tape.out != out || tape.flip != flip;
             // Linear in time, like the flip: tape_matrix shapes it into the
             // pull, the presentation and the flight to the deck.
-            let step = dt / LOAD_TIME;
+            let step = dt / (LOAD_TIME * motion);
             tape.out = if out > tape.out { (tape.out + step).min(out) } else { (tape.out - step).max(out) };
             // Linear in time: tape_matrix shapes it into the rise and the turn.
-            let step = dt / FLIP_TIME;
+            let step = dt / (FLIP_TIME * motion);
             tape.flip = if flip > tape.flip { (tape.flip + step).min(flip) } else { (tape.flip - step).max(flip) };
         }
         self.settling = moving
@@ -2668,7 +2712,7 @@ impl App {
             self.reels.1 += dt * TAPE_SPEED * speed / self.packs.1;
         }
         let goal = match self.current {
-            Some(i) if self.albums[i].mix.is_none() => accent_color(self.tapes[i].average),
+            Some(i) if self.albums[i].mix.is_none() && self.settings.accents => accent_color(self.tapes[i].average),
             _ => INK,
         };
         let ease = 1.0 - (-dt * 4.0).exp();
@@ -2695,6 +2739,10 @@ impl App {
         }
         if self.audio.finished() {
             self.next();
+        }
+        if let Some(scanned) = self.rescan.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.rescan = None;
+            self.apply_rescan(scanned);
         }
         self.sync_desktop(dt);
         if get_time() - self.saved_at > 5.0 && (self.dirty_state || self.audio.is_playing()) {
@@ -2751,7 +2799,7 @@ impl App {
                 let t = &self.tapes[i];
                 // Tapes resting on the rail reflect in the floor; one being turned
                 // around or leaving for the deck has left it.
-                if t.flip < 0.01 && t.out < 0.02 {
+                if t.flip < 0.01 && t.out < 0.02 && self.settings.reflection() > 0.0 {
                     self.draw_tape(lay, i, fade, true, pass);
                 }
                 // A tape on its way to the deck comes out of the dark of the far
@@ -2913,10 +2961,283 @@ impl App {
         self.fonts.draw("SFX", pill.x + 7.0, pill.y + 13.0, 10.0, if self.sfx { BLACK } else { DIM }, true);
     }
 
+    /// The choices a settings field offers; empty for the volume slider and
+    /// one label for an action.
+    fn field_choices(&self, field: Field) -> Vec<&'static str> {
+        use settings::*;
+        match field {
+            Field::Volume => vec![],
+            Field::SeekStep => SEEK_STEPS.to_vec(),
+            Field::Sfx | Field::Mpris | Field::Fullscreen | Field::Accents => OFF_ON.to_vec(),
+            Field::View => View::ALL.iter().map(|v| v.label()).collect(),
+            Field::Sort => Sort::ALL.iter().map(|s| s.label()).collect(),
+            Field::Reflections | Field::Glass | Field::Glow => LEVELS.to_vec(),
+            Field::Motion | Field::KeyRepeat => PACES.to_vec(),
+            Field::LyricPace => LYRIC_PACES.to_vec(),
+            Field::PlayingFps => PLAYING_FPS.to_vec(),
+            Field::IdleFps => IDLE_FPS.to_vec(),
+            Field::Rescan => vec!["RESCAN"],
+            Field::Hints => vec!["SHOW AGAIN"],
+        }
+    }
+
+    fn field_value(&self, field: Field) -> usize {
+        let s = &self.settings;
+        match field {
+            Field::Volume | Field::Rescan | Field::Hints => 0,
+            Field::SeekStep => s.seek_step,
+            Field::Sfx => self.sfx as usize,
+            Field::Mpris => s.mpris as usize,
+            Field::View => View::ALL.iter().position(|&v| v == self.view).unwrap_or(0),
+            Field::Sort => Sort::ALL.iter().position(|&v| v == self.sort).unwrap_or(0),
+            Field::Fullscreen => self.fullscreen as usize,
+            Field::Accents => s.accents as usize,
+            Field::Reflections => s.reflections,
+            Field::Glass => s.glass,
+            Field::Glow => s.glow,
+            Field::Motion => s.motion,
+            Field::LyricPace => s.lyric_pace,
+            Field::KeyRepeat => s.key_repeat,
+            Field::PlayingFps => s.playing_fps,
+            Field::IdleFps => s.idle_fps,
+        }
+    }
+
+    /// Applies choice `v` of a settings field (or runs its action) and saves.
+    fn set_field(&mut self, field: Field, v: usize) {
+        match field {
+            Field::Volume => {}
+            Field::SeekStep => self.settings.seek_step = v,
+            Field::Sfx => self.sfx = v == 1,
+            Field::Mpris => {
+                self.settings.mpris = v == 1;
+                self.desktop = if v == 1 { Desktop::new() } else { Desktop::off() };
+            }
+            Field::View => self.set_view(View::ALL[v]),
+            Field::Sort => self.set_sort(Sort::ALL[v]),
+            Field::Fullscreen => {
+                self.fullscreen = v == 1;
+                set_fullscreen(self.fullscreen);
+            }
+            Field::Accents => self.settings.accents = v == 1,
+            Field::Reflections => self.settings.reflections = v,
+            Field::Glass => {
+                self.settings.glass = v;
+                // The J-card's back sheet is part of the tape; nothing to repaint.
+            }
+            Field::Glow => self.settings.glow = v,
+            Field::Motion => self.settings.motion = v,
+            Field::LyricPace => self.settings.lyric_pace = v,
+            Field::KeyRepeat => self.settings.key_repeat = v,
+            Field::PlayingFps => self.settings.playing_fps = v,
+            Field::IdleFps => self.settings.idle_fps = v,
+            Field::Rescan => self.start_rescan(),
+            Field::Hints => {
+                self.learned = 0;
+                self.toast = Some(("CONTROL HINTS WILL SHOW AGAIN".into(), get_time()));
+            }
+        }
+        self.save();
+    }
+
+    /// The settings panel's card, the height of its content, and for each
+    /// field its row and the rectangles of its choices (or slider), at the
+    /// current scroll.
+    fn settings_layout(&self) -> (Rect, f32, Vec<(Field, Rect, Vec<Rect>)>) {
+        let f = &self.fonts;
+        let (sw, sh) = (screen_width(), screen_height());
+        let w = 640.0_f32.min(sw - 2.0 * SP_L);
+        let mut content = 64.0;
+        let mut heading = "";
+        for (h, _, _) in FIELDS {
+            if h != heading {
+                content += 34.0;
+                heading = h;
+            }
+            content += SETTINGS_ROW;
+        }
+        content += SP_M;
+        let h = content.min(sh - 2.0 * SP_L);
+        let card = Rect::new((sw - w) / 2.0, (sh - h) / 2.0, w, h);
+        let mut y = card.y + 64.0 - self.settings_scroll;
+        let mut heading = "";
+        let mut rows = Vec::new();
+        for (h, field, _) in FIELDS {
+            if h != heading {
+                y += 34.0;
+                heading = h;
+            }
+            let row = Rect::new(card.x + SP_M, y, card.w - 2.0 * SP_M, SETTINGS_ROW - 4.0);
+            let right = row.right() - SP_S;
+            let mut controls = Vec::new();
+            if field == Field::Volume {
+                controls.push(Rect::new(right - 200.0, row.center().y - 3.0, 200.0, 6.0));
+            } else {
+                let mut x = right;
+                for label in self.field_choices(field).iter().rev() {
+                    let w = f.width(label, 10.0, false) + 14.0;
+                    x -= w;
+                    controls.push(Rect::new(x, row.center().y - 9.0, w, 18.0));
+                    x -= 4.0;
+                }
+                controls.reverse();
+            }
+            rows.push((field, row, controls));
+            y += SETTINGS_ROW;
+        }
+        (card, content, rows)
+    }
+
+    fn open_settings(&mut self, open: bool) {
+        self.show_settings = open;
+        self.show_help = false;
+        self.held = None;
+    }
+
+    /// Keys and mouse while the settings panel is open: it takes all input.
+    fn input_settings(&mut self) {
+        while get_char_pressed().is_some() {}
+        let ctrl = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
+        if is_key_pressed(KeyCode::Escape) || (ctrl && is_key_pressed(KeyCode::Comma)) {
+            self.open_settings(false);
+            return;
+        }
+        let n = FIELDS.len();
+        if self.repeat(KeyCode::Down) {
+            self.settings_row = (self.settings_row + 1).min(n - 1);
+        }
+        if self.repeat(KeyCode::Up) {
+            self.settings_row = self.settings_row.saturating_sub(1);
+        }
+        let field = FIELDS[self.settings_row].1;
+        let count = self.field_choices(field).len();
+        let (left, right) = (self.repeat(KeyCode::Left), self.repeat(KeyCode::Right));
+        if field == Field::Volume {
+            if left || right {
+                self.set_volume(self.volume + if right { 0.05 } else { -0.05 });
+                self.save();
+            }
+        } else if count > 1 && (left || right) {
+            let v = self.field_value(field);
+            let v = if right { (v + 1).min(count - 1) } else { v.saturating_sub(1) };
+            if v != self.field_value(field) {
+                self.set_field(field, v);
+            }
+        } else if count == 1 && is_key_pressed(KeyCode::Enter) {
+            self.set_field(field, 0);
+        }
+
+        let (card, content, rows) = self.settings_layout();
+        // Keep the selected row in view; the wheel scrolls too.
+        let max = (content - card.h).max(0.0);
+        let (_, wy) = mouse_wheel();
+        if wy != 0.0 {
+            self.settings_scroll -= wy.signum() * 40.0;
+        }
+        if let Some((_, row, _)) = rows.get(self.settings_row)
+            && (left || right || is_key_down(KeyCode::Up) || is_key_down(KeyCode::Down))
+        {
+            if row.y < card.y + 64.0 {
+                self.settings_scroll -= card.y + 64.0 - row.y;
+            } else if row.bottom() > card.bottom() - SP_M {
+                self.settings_scroll += row.bottom() - (card.bottom() - SP_M);
+            }
+        }
+        self.settings_scroll = self.settings_scroll.clamp(0.0, max);
+
+        let mouse: Vec2 = mouse_position().into();
+        if is_mouse_button_pressed(MouseButton::Left) {
+            if !card.contains(mouse) {
+                self.open_settings(false);
+                return;
+            }
+            for (k, (field, row, controls)) in rows.iter().enumerate() {
+                if !row.contains(mouse) || mouse.y < card.y + 56.0 || mouse.y > card.bottom() {
+                    continue;
+                }
+                self.settings_row = k;
+                if *field == Field::Volume {
+                    self.settings_drag = true;
+                } else if let Some(v) = controls.iter().position(|r| r.contains(mouse)) {
+                    self.set_field(*field, v);
+                }
+            }
+        }
+        if self.settings_drag {
+            if let Some((_, _, controls)) = rows.iter().find(|(f, _, _)| *f == Field::Volume) {
+                let bar = controls[0];
+                self.set_volume((mouse.x - bar.x) / bar.w);
+            }
+            if is_mouse_button_released(MouseButton::Left) {
+                self.settings_drag = false;
+                self.save();
+            }
+        }
+    }
+
+    /// The settings panel over the whole window.
+    fn draw_settings(&self) {
+        let f = &self.fonts;
+        let (card, _, rows) = self.settings_layout();
+        draw_rectangle(0.0, 0.0, screen_width(), screen_height(), Color::new(0.0, 0.0, 0.0, 0.6));
+        round_rect(card, R_PANEL, FRAME_BG);
+        round_rect_lines(card, R_PANEL, 1.5, LINE);
+        f.draw("SETTINGS", card.x + SP_L, card.y + 36.0, 16.0, INK, false);
+        let keys = "↑ ↓ choose   ← → change   ESC close";
+        f.draw(keys, card.right() - SP_L - f.width(keys, 10.0, false), card.y + 34.0, 10.0, DIM, false);
+        draw_rectangle(card.x + SP_M, card.y + 50.0, card.w - 2.0 * SP_M, 1.0, Color::new(1.0, 1.0, 1.0, 0.15));
+
+        // Rows scroll under the title.
+        let body = Rect::new(card.x, card.y + 56.0, card.w, card.h - 60.0);
+        let gl = unsafe { get_internal_gl() };
+        gl.quad_gl.scissor(Some((body.x as i32, body.y as i32, body.w as i32, body.h as i32)));
+        let mouse: Vec2 = mouse_position().into();
+        let mut heading = "";
+        for (k, ((h, field, label), (_, row, controls))) in FIELDS.iter().zip(&rows).enumerate() {
+            if *h != heading {
+                f.draw(h, row.x + SP_S, row.y - 12.0, 10.0, DIM, false);
+                heading = h;
+            }
+            let selected = k == self.settings_row;
+            if selected {
+                round_rect(*row, R_CHIP, Color::new(1.0, 1.0, 1.0, 0.07));
+            }
+            let text = match field {
+                Field::Rescan => format!("{label}  ·  {}", self.music_root.display()),
+                _ => label.to_string(),
+            };
+            let room = controls.first().map_or(row.right(), |c| c.x) - row.x - 2.0 * SP_M;
+            f.draw(&f.fit(&text, 12.0, false, room), row.x + SP_S, row.center().y + 4.0, 12.0, if selected { INK } else { DIM }, false);
+            if *field == Field::Volume {
+                let bar = controls[0];
+                round_rect(bar, 3.0, Color::new(1.0, 1.0, 1.0, 0.15));
+                round_rect(Rect::new(bar.x, bar.y, bar.w * self.volume, bar.h), 3.0, self.accent);
+                draw_circle(bar.x + bar.w * self.volume, bar.center().y, 6.0, INK);
+                let pct = format!("{}", (self.volume * 100.0).round() as u32);
+                f.draw(&pct, bar.x - SP_S - f.width(&pct, 11.0, false), row.center().y + 4.0, 11.0, INK, false);
+                continue;
+            }
+            let value = self.field_value(*field);
+            let choices = self.field_choices(*field);
+            let action = choices.len() == 1;
+            for (v, (pill, label)) in controls.iter().zip(choices).enumerate() {
+                let on = !action && v == value;
+                let hot = pill.contains(mouse);
+                if on {
+                    round_rect(*pill, R_CHIP, INK);
+                } else {
+                    round_rect_lines(*pill, R_CHIP, 1.0, Color::new(1.0, 1.0, 1.0, if hot || action { 0.6 } else { 0.3 }));
+                }
+                f.draw(label, pill.x + 7.0, pill.y + 13.0, 10.0, if on { BLACK } else if action { INK } else { DIM }, false);
+            }
+        }
+        gl.quad_gl.scissor(None);
+    }
+
     /// Sheet of keyboard and mouse shortcuts over the stage. Regular weight
     /// only: new sizes of the bold face here garbled its glyph atlas.
     fn draw_help(&self, lay: &Layout) {
-        const KEYS: [(&str, &str); 18] = [
+        const KEYS: [(&str, &str); 19] = [
             ("← →", "Previous / next tape"),
             ("↑ ↓", "Previous / next track (on a turned tape: pick a track)"),
             ("ENTER", "Play the tape or track in focus"),
@@ -2928,6 +3249,7 @@ impl App {
             ("TAB", "Switch rail / grid"),
             ("TYPE", "Search; ← → step through matches, ESC clears"),
             ("F5", "Rescan the music folder"),
+            ("CTRL+,", "Settings"),
             ("F11", "Fullscreen"),
             ("CLICK", "Play a tape or track"),
             ("MIDDLE-CLICK", "Queue (with SHIFT: play next)"),
@@ -2960,7 +3282,8 @@ impl App {
     /// playing cover's color: a radial falloff clipped to the stage, laid over
     /// the rail like a faint haze.
     fn draw_glow(&self, lay: &Layout) {
-        if self.current.is_none() {
+        let glow = self.settings.glow();
+        if self.current.is_none() || glow == 0.0 {
             return;
         }
         let s = lay.stage;
@@ -2971,11 +3294,11 @@ impl App {
         // Rings of falling brightness approximate a smooth falloff.
         const STEPS: usize = 48;
         const RINGS: usize = 6;
-        let mut vertices = vec![v(c, lit(GLOW))];
+        let mut vertices = vec![v(c, lit(glow))];
         let mut indices = Vec::new();
         for r in 1..=RINGS {
             let t = r as f32 / RINGS as f32;
-            let alpha = GLOW * (1.0 - t).powi(2);
+            let alpha = glow * (1.0 - t).powi(2);
             for k in 0..STEPS {
                 let a = k as f32 / STEPS as f32 * std::f32::consts::TAU;
                 vertices.push(v(c + vec2(a.cos(), a.sin()) * radius * t, lit(alpha)));
@@ -3013,7 +3336,8 @@ impl App {
             self.tape_matrix(lay, i)
         };
         // Reflections are brightest where the tape meets the floor.
-        let gloss = |p: Vec3| if mirror { REFLECTION * (1.0 - (p.y + h.y) / (2.0 * h.y)).clamp(0.0, 1.0).powi(2) } else { 1.0 };
+        let reflection = self.settings.reflection();
+        let gloss = |p: Vec3| if mirror { reflection * (1.0 - (p.y + h.y) / (2.0 * h.y)).clamp(0.0, 1.0).powi(2) } else { 1.0 };
         // Fade by darkening into the black stage rather than with alpha, which
         // would leak into the window's own transparency. Tapes left out by the
         // search sink into the dark the same way.
@@ -3111,7 +3435,7 @@ impl App {
                 // inside the rim, strongest at the top right corner and fading
                 // along the edges.
                 if !mirror {
-                    draw_recess(&m, h.z, face_z, 1.0, shade, &gloss, Recess::Glass);
+                    draw_recess(&m, h.z, face_z, 1.0, shade, &gloss, Recess::Glass(self.settings.sheen()));
                     let z = h.z + 0.003;
                     let rim = |p: Vec3, a: f32| {
                         let v = (255.0 * shade) as u8;
@@ -3152,7 +3476,7 @@ impl App {
                         let vertices = vec![corner(row.x, row.y), corner(row.right(), row.y), corner(row.right(), row.bottom()), corner(row.x, row.bottom())];
                         draw_mesh(&Mesh { vertices, indices: vec![0, 1, 2, 0, 2, 3], texture: None });
                     }
-                    draw_recess(&m, -h.z, z, -1.0, shade, &|_| 1.0, Recess::Glass);
+                    draw_recess(&m, -h.z, z, -1.0, shade, &|_| 1.0, Recess::Glass(self.settings.sheen()));
                 }
             }
         }
@@ -3252,7 +3576,8 @@ impl App {
             // so the fill finishes early: within 90% of the gap, and no slower
             // than a typical singing pace for the line's length.
             let gap = (next_at - line.at).max(0.1);
-            let sung = (0.5 + text.chars().count() as f32 * 0.1).min(gap * 0.9).max(0.3);
+            let (share, per_char) = self.settings.lyric_pace();
+            let sung = (0.5 + text.chars().count() as f32 * per_char).min(gap * share).max(0.3);
             let progress = ((pos - line.at) / sung).clamp(0.0, 1.0);
             let mut fill = progress * widths.iter().sum::<f32>();
             let line_h = size * 1.25;
@@ -4307,7 +4632,8 @@ fn draw_recess(m: &Mat4, surface: f32, inner: f32, side: f32, shade: f32, gloss:
     }
     // Each band runs top to bottom, leaning right as seen, brightest in its middle.
     let z = surface + 0.001 * side;
-    for (left, width, a) in [(-0.95, 0.5, GLASS_SHEEN), (-0.2, 0.14, GLASS_SHEEN * 0.7)] {
+    let Recess::Glass(sheen) = part else { return };
+    for (left, width, a) in [(-0.95, 0.5, sheen), (-0.2, 0.14, sheen * 0.7)] {
         let base = vertices.len() as u16;
         let lean = 0.3;
         for (x, alpha) in [(left, 0.0), (left + width / 2.0, a), (left + width, 0.0)] {
@@ -4322,6 +4648,55 @@ fn draw_recess(m: &Mat4, surface: f32, inner: f32, side: f32, shade: f32, gloss:
     draw_mesh(&Mesh { vertices, indices, texture: None });
 }
 
+/// One line of the settings panel.
+#[derive(Clone, Copy, PartialEq)]
+enum Field {
+    Volume,
+    SeekStep,
+    Sfx,
+    Mpris,
+    View,
+    Sort,
+    Fullscreen,
+    Accents,
+    Reflections,
+    Glass,
+    Glow,
+    Motion,
+    LyricPace,
+    KeyRepeat,
+    PlayingFps,
+    IdleFps,
+    Rescan,
+    Hints,
+}
+
+/// The settings panel, grouped under headings: (heading, field, label).
+const FIELDS: [(&str, Field, &str); 18] = [
+    ("PLAYBACK", Field::Volume, "Volume"),
+    ("PLAYBACK", Field::SeekStep, "Seek step ( [ ] and media keys)"),
+    ("PLAYBACK", Field::Sfx, "Deck sound effects"),
+    ("PLAYBACK", Field::Mpris, "Status bar and media keys (MPRIS)"),
+    ("LOOK", Field::View, "View"),
+    ("LOOK", Field::Sort, "Sort"),
+    ("LOOK", Field::Fullscreen, "Fullscreen"),
+    ("LOOK", Field::Accents, "Colors from the cover"),
+    ("LOOK", Field::Reflections, "Floor reflections"),
+    ("LOOK", Field::Glass, "Reflections on the plastic"),
+    ("LOOK", Field::Glow, "Cover light on the stage"),
+    ("MOTION", Field::Motion, "Tape animations"),
+    ("MOTION", Field::LyricPace, "Lyrics fill"),
+    ("MOTION", Field::KeyRepeat, "Held key repeat"),
+    ("PERFORMANCE", Field::PlayingFps, "Frame rate while playing"),
+    ("PERFORMANCE", Field::IdleFps, "Frame rate when idle"),
+    ("LIBRARY", Field::Rescan, "Music folder"),
+    ("LIBRARY", Field::Hints, "Control hints"),
+];
+
+const OFF_ON: [&str; 2] = ["OFF", "ON"];
+/// Height of a line in the settings panel.
+const SETTINGS_ROW: f32 = 30.0;
+
 /// Which part of the tapes a stage pass draws; see `draw_stage`.
 #[derive(Clone, Copy, PartialEq)]
 enum Pass {
@@ -4335,7 +4710,8 @@ enum Pass {
 #[derive(Clone, Copy, PartialEq)]
 enum Recess {
     Walls,
-    Glass,
+    /// With the brightness of its reflections.
+    Glass(f32),
 }
 
 /// Rounded-rectangle outline of the tape front, counter-clockwise, as
@@ -4474,6 +4850,9 @@ async fn main() {
         app.draw_stage(&lay);
         lap(4);
         app.draw_side(&lay);
+        if app.show_settings {
+            app.draw_settings();
+        }
         lap(5);
         app.present();
         lap(6);
