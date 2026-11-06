@@ -5,6 +5,7 @@ edition = "2024"
 description = "Cassette-wall music player for a local library, with bit-perfect playback"
 readme = "README.md"
 license = "MIT"
+repository = "https://github.com/Biirthday/tapedeck"
 authors = ["LLC171 <privacy@llc171.anonaddy.me>"]
 
 [dependencies]

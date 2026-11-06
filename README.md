@@ -54,7 +54,7 @@ Optional, at run time:
 ## Getting started
 
 ```sh
-git clone <repository-url> tapedeck
+git clone https://github.com/Biirthday/tapedeck.git
 cd tapedeck
 cargo run --release
 ```
