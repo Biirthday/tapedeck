@@ -37,7 +37,7 @@ const VISIBLE: (f32, f32) = (-2.6, 17.0);
 /// Rail positions over which the farthest tapes fade out.
 const FAR_FADE: f32 = 10.0;
 /// Width the view and sort switches take in the stage's top right corner.
-const SWITCHES_W: f32 = 460.0;
+const SWITCHES_W: f32 = 500.0;
 /// Direction the key light comes from, on the tape's face plane, and how
 /// bright the metallic rim it catches is.
 const SHEEN_DIR: Vec2 = vec2(0.55, 0.835);
@@ -340,6 +340,9 @@ struct Saved {
     show_queue: bool,
     #[serde(default)]
     settings: Settings,
+    /// Music folder chosen in the settings; MUSIC_DIR still wins.
+    #[serde(default)]
+    music_dir: Option<PathBuf>,
 }
 
 const LEARNED_LISTEN: u8 = 1;
@@ -552,7 +555,9 @@ struct App {
     /// Cover decoders for tapes a rescan added.
     extra_covers: Vec<Receiver<Cover>>,
     /// A rescan of the music folder running in the background.
-    rescan: Option<Receiver<Vec<Album>>>,
+    rescan: Option<Receiver<(Vec<Album>, Vec<PathBuf>)>>,
+    /// Lyrics folders inside the music folder; see `library::lyric_mirrors`.
+    lyric_dirs: Vec<PathBuf>,
     covers_done: Arc<AtomicUsize>,
     cover_jobs: usize,
     colors_saved: bool,
@@ -569,6 +574,14 @@ struct App {
     settings_scroll: f32,
     /// The volume slider in the panel is being dragged.
     settings_drag: bool,
+    /// Button the keyboard has on an action line of the panel.
+    settings_button: usize,
+    /// A music folder path being typed in the panel.
+    folder_edit: Option<String>,
+    /// The desktop's folder chooser is open; its answer arrives here.
+    folder_pick: Option<Receiver<Option<PathBuf>>>,
+    /// Music folder chosen in the settings, remembered for the next start.
+    music_choice: Option<PathBuf>,
     /// Mechanical deck noises on key presses, loading and ejecting.
     sfx: bool,
     view: View,
@@ -686,7 +699,7 @@ impl App {
         Layout::new(self.rec.is_some(), !self.queue.is_empty())
     }
 
-    fn new(library: Vec<Album>, saved: Saved, music_root: PathBuf) -> Self {
+    fn new(library: Vec<Album>, lyric_dirs: Vec<PathBuf>, saved: Saved, music_root: PathBuf) -> Self {
         let mixes = mixtape::load();
         let mut albums = vec![mixtape::blank()];
         albums.extend(mixes.iter().map(mixtape::album));
@@ -735,6 +748,7 @@ impl App {
             covers,
             extra_covers: Vec::new(),
             rescan: None,
+            lyric_dirs,
             covers_done,
             cover_jobs,
             colors_saved: false,
@@ -749,6 +763,10 @@ impl App {
             settings_row: 0,
             settings_scroll: 0.0,
             settings_drag: false,
+            settings_button: 0,
+            folder_edit: None,
+            folder_pick: None,
+            music_choice: saved.music_dir.clone(),
             sfx: !saved.quiet,
             view: saved.view,
             grid_scroll: 0.0,
@@ -1129,6 +1147,7 @@ impl App {
             grid_top: self.grid_top(),
             show_queue: self.show_queue,
             settings: self.settings,
+            music_dir: self.music_choice.clone(),
         };
         if let Some(path) = state_path() {
             let _ = std::fs::create_dir_all(path.parent().unwrap());
@@ -1157,12 +1176,14 @@ impl App {
     /// for new albums join it, tapes whose album is gone leave it (except the
     /// one in the deck). Saved plays and positions are kept by album path.
     fn apply_rescan(&mut self, scanned: Vec<Album>) {
-        let found: std::collections::HashSet<String> = scanned.iter().map(|a| a.rel.clone()).collect();
-        let known: std::collections::HashSet<String> = self.albums.iter().filter(|a| a.mix.is_none()).map(|a| a.rel.clone()).collect();
+        // Albums are matched by their folder, which stays right when the music
+        // folder itself changes.
+        let found: std::collections::HashSet<PathBuf> = scanned.iter().map(|a| a.dir.clone()).collect();
+        let known: std::collections::HashSet<PathBuf> = self.albums.iter().filter(|a| a.mix.is_none()).map(|a| a.dir.clone()).collect();
         let mut removed = 0;
         let mut k = 0;
         while k < self.albums.len() {
-            let gone = self.albums[k].mix.is_none() && !found.contains(&self.albums[k].rel) && self.current != Some(k);
+            let gone = self.albums[k].mix.is_none() && !found.contains(&self.albums[k].dir) && self.current != Some(k);
             if gone {
                 if let Some(face) = self.tapes[k].face.take() {
                     self.face_pool.push(face);
@@ -1178,7 +1199,7 @@ impl App {
             }
         }
         let mut jobs = Vec::new();
-        for album in scanned.into_iter().filter(|a| !known.contains(&a.rel)) {
+        for album in scanned.into_iter().filter(|a| !known.contains(&a.dir)) {
             let id = self.next_id;
             self.next_id += 1;
             jobs.push((id, album.dir.clone(), album.tracks[0].path.clone()));
@@ -1273,7 +1294,7 @@ impl App {
         }
         self.track = n % album.tracks.len();
         let track = &album.tracks[self.track];
-        self.lyrics = library::read_lyrics(track, &self.music_root);
+        self.lyrics = library::read_lyrics(track, &self.music_root, &self.lyric_dirs);
         self.lyrics_scroll = 0.0;
         self.lyric_preview = None;
         let path = track.path.clone();
@@ -1775,7 +1796,11 @@ impl App {
             self.input_settings();
             return;
         }
-        if ctrl && is_key_pressed(KeyCode::Comma) {
+        // Debug aid: TAPEDECK_KEYS=1 prints the keys the window receives.
+        if std::env::var("TAPEDECK_KEYS").is_ok() && !get_keys_pressed().is_empty() {
+            eprintln!("[keys] pressed {:?}  down {:?}", get_keys_pressed(), get_keys_down());
+        }
+        if (ctrl && is_key_pressed(KeyCode::Comma)) || is_key_pressed(KeyCode::F2) {
             self.open_settings(true);
             while get_char_pressed().is_some() {}
             return;
@@ -1834,10 +1859,13 @@ impl App {
             || lay.ruler.contains(mouse)
             || self.sort_pills(lay).iter().any(|(_, r)| r.contains(mouse))
             || self.view_pills(lay).iter().any(|(_, r)| r.contains(mouse))
-            || self.sfx_pill(lay).contains(mouse);
+            || self.sfx_pill(lay).contains(mouse)
+            || self.gear_button(lay).contains(mouse);
         if is_mouse_button_pressed(MouseButton::Left) {
             if lay.ruler.contains(mouse) {
                 self.ruler_drag = true;
+            } else if self.gear_button(lay).contains(mouse) {
+                self.open_settings(true);
             } else if self.sfx_pill(lay).contains(mouse) {
                 self.sfx = !self.sfx;
                 self.sfx(Sfx::Key);
@@ -2525,6 +2553,13 @@ impl App {
     }
 
     /// View switches, left of the sort switches.
+    /// Gear button left of the view switches; opens the settings.
+    fn gear_button(&self, lay: &Layout) -> Rect {
+        let first = self.view_pills(lay).first().map(|(_, r)| r.x).unwrap_or(lay.stage.right() - SP_L);
+        let x = first - self.fonts.width("VIEW", 10.0, false) - SP_S - SP_L - 18.0;
+        Rect::new(x, lay.stage.y + SP_M, 18.0, 18.0)
+    }
+
     fn view_pills(&self, lay: &Layout) -> Vec<(View, Rect)> {
         let sort_x = self.sort_pills(lay).first().map(|(_, r)| r.x).unwrap_or(lay.stage.right() - SP_L);
         let mut x = sort_x - self.fonts.width("SORT", 10.0, false) - SP_S - SP_L;
@@ -2740,9 +2775,17 @@ impl App {
         if self.audio.finished() {
             self.next();
         }
-        if let Some(scanned) = self.rescan.as_ref().and_then(|rx| rx.try_recv().ok()) {
+        if let Some((scanned, lyric_dirs)) = self.rescan.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.rescan = None;
+            self.lyric_dirs = lyric_dirs;
             self.apply_rescan(scanned);
+        }
+        if let Some(answer) = self.folder_pick.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.folder_pick = None;
+            match answer {
+                Some(path) => self.set_music_folder(path),
+                None => self.toast = Some(("NO FOLDER CHOSEN".into(), get_time())),
+            }
         }
         self.sync_desktop(dt);
         if get_time() - self.saved_at > 5.0 && (self.dirty_state || self.audio.is_playing()) {
@@ -2976,7 +3019,7 @@ impl App {
             Field::LyricPace => LYRIC_PACES.to_vec(),
             Field::PlayingFps => PLAYING_FPS.to_vec(),
             Field::IdleFps => IDLE_FPS.to_vec(),
-            Field::Rescan => vec!["RESCAN"],
+            Field::MusicFolder => vec!["BROWSE", "TYPE", "RESCAN"],
             Field::Hints => vec!["SHOW AGAIN"],
         }
     }
@@ -2984,7 +3027,7 @@ impl App {
     fn field_value(&self, field: Field) -> usize {
         let s = &self.settings;
         match field {
-            Field::Volume | Field::Rescan | Field::Hints => 0,
+            Field::Volume | Field::MusicFolder | Field::Hints => 0,
             Field::SeekStep => s.seek_step,
             Field::Sfx => self.sfx as usize,
             Field::Mpris => s.mpris as usize,
@@ -3031,7 +3074,11 @@ impl App {
             Field::KeyRepeat => self.settings.key_repeat = v,
             Field::PlayingFps => self.settings.playing_fps = v,
             Field::IdleFps => self.settings.idle_fps = v,
-            Field::Rescan => self.start_rescan(),
+            Field::MusicFolder => match v {
+                0 => self.browse_folder(),
+                1 => self.folder_edit = Some(self.music_root.display().to_string()),
+                _ => self.start_rescan(),
+            },
             Field::Hints => {
                 self.learned = 0;
                 self.toast = Some(("CONTROL HINTS WILL SHOW AGAIN".into(), get_time()));
@@ -3088,6 +3135,59 @@ impl App {
         (card, content, rows)
     }
 
+    /// Opens the desktop's folder chooser in the background; `tick` takes
+    /// the answer.
+    fn browse_folder(&mut self) {
+        if self.folder_pick.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let start = self.music_root.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(desktop::pick_folder(&start));
+        });
+        self.folder_pick = Some(rx);
+    }
+
+    /// Makes `path` the music folder: the rail is rebuilt from it and it is
+    /// remembered for the next start.
+    fn set_music_folder(&mut self, path: PathBuf) {
+        if !path.is_dir() {
+            self.toast = Some((format!("NOT A FOLDER: {}", path.display()), get_time()));
+            return;
+        }
+        self.music_root = path.clone();
+        self.music_choice = Some(path);
+        // A scan of the old folder still running would undo the switch.
+        self.rescan = None;
+        self.start_rescan();
+        self.save();
+    }
+
+    /// Typing a music folder path in the settings panel.
+    fn input_folder_edit(&mut self) {
+        let Some(mut path) = self.folder_edit.take() else { return };
+        while let Some(c) = get_char_pressed() {
+            if !c.is_control() {
+                path.push(c);
+            }
+        }
+        if self.repeat(KeyCode::Backspace) {
+            path.pop();
+        }
+        if is_key_pressed(KeyCode::Tab) {
+            path = complete_dir(&path);
+        }
+        if is_key_pressed(KeyCode::Escape) {
+            return;
+        }
+        if is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter) {
+            self.set_music_folder(expand_home(&path));
+            return;
+        }
+        self.folder_edit = Some(path);
+    }
+
     fn open_settings(&mut self, open: bool) {
         self.show_settings = open;
         self.show_help = false;
@@ -3096,23 +3196,43 @@ impl App {
 
     /// Keys and mouse while the settings panel is open: it takes all input.
     fn input_settings(&mut self) {
+        if self.folder_edit.is_some() {
+            self.input_folder_edit();
+            return;
+        }
         while get_char_pressed().is_some() {}
         let ctrl = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
-        if is_key_pressed(KeyCode::Escape) || (ctrl && is_key_pressed(KeyCode::Comma)) {
+        if is_key_pressed(KeyCode::Escape) || is_key_pressed(KeyCode::F2) || (ctrl && is_key_pressed(KeyCode::Comma)) {
             self.open_settings(false);
             return;
         }
+        if self.folder_edit.is_some() {
+            self.input_folder_edit();
+            return;
+        }
         let n = FIELDS.len();
+        let row = self.settings_row;
         if self.repeat(KeyCode::Down) {
             self.settings_row = (self.settings_row + 1).min(n - 1);
         }
         if self.repeat(KeyCode::Up) {
             self.settings_row = self.settings_row.saturating_sub(1);
         }
+        if row != self.settings_row {
+            self.settings_button = 0;
+        }
         let field = FIELDS[self.settings_row].1;
         let count = self.field_choices(field).len();
         let (left, right) = (self.repeat(KeyCode::Left), self.repeat(KeyCode::Right));
-        if field == Field::Volume {
+        if is_action(field) {
+            // Buttons: the arrows pick one, Enter presses it.
+            if left || right {
+                self.settings_button = if right { (self.settings_button + 1).min(count - 1) } else { self.settings_button.saturating_sub(1) };
+            }
+            if is_key_pressed(KeyCode::Enter) {
+                self.set_field(field, self.settings_button.min(count - 1));
+            }
+        } else if field == Field::Volume {
             if left || right {
                 self.set_volume(self.volume + if right { 0.05 } else { -0.05 });
                 self.save();
@@ -3123,8 +3243,6 @@ impl App {
             if v != self.field_value(field) {
                 self.set_field(field, v);
             }
-        } else if count == 1 && is_key_pressed(KeyCode::Enter) {
-            self.set_field(field, 0);
         }
 
         let (card, content, rows) = self.settings_layout();
@@ -3159,6 +3277,7 @@ impl App {
                 if *field == Field::Volume {
                     self.settings_drag = true;
                 } else if let Some(v) = controls.iter().position(|r| r.contains(mouse)) {
+                    self.settings_button = v;
                     self.set_field(*field, v);
                 }
             }
@@ -3183,7 +3302,11 @@ impl App {
         round_rect(card, R_PANEL, FRAME_BG);
         round_rect_lines(card, R_PANEL, 1.5, LINE);
         f.draw("SETTINGS", card.x + SP_L, card.y + 36.0, 16.0, INK, false);
-        let keys = "↑ ↓ choose   ← → change   ESC close";
+        let keys = if self.folder_edit.is_some() {
+            "ENTER use   TAB complete   ESC cancel"
+        } else {
+            "↑ ↓ choose   ← → change   ESC / F2 close"
+        };
         f.draw(keys, card.right() - SP_L - f.width(keys, 10.0, false), card.y + 34.0, 10.0, DIM, false);
         draw_rectangle(card.x + SP_M, card.y + 50.0, card.w - 2.0 * SP_M, 1.0, Color::new(1.0, 1.0, 1.0, 0.15));
 
@@ -3203,7 +3326,11 @@ impl App {
                 round_rect(*row, R_CHIP, Color::new(1.0, 1.0, 1.0, 0.07));
             }
             let text = match field {
-                Field::Rescan => format!("{label}  ·  {}", self.music_root.display()),
+                Field::MusicFolder => match &self.folder_edit {
+                    Some(path) => format!("{path}{}", if get_time().fract() < 0.5 { "_" } else { " " }),
+                    None if self.folder_pick.is_some() => format!("{label}  ·  CHOOSING…"),
+                    None => format!("{label}  ·  {}", self.music_root.display()),
+                },
                 _ => label.to_string(),
             };
             let room = controls.first().map_or(row.right(), |c| c.x) - row.x - 2.0 * SP_M;
@@ -3219,9 +3346,10 @@ impl App {
             }
             let value = self.field_value(*field);
             let choices = self.field_choices(*field);
-            let action = choices.len() == 1;
+            let action = is_action(*field);
             for (v, (pill, label)) in controls.iter().zip(choices).enumerate() {
-                let on = !action && v == value;
+                // An action's button is lit when the keyboard has it.
+                let on = if action { selected && v == self.settings_button } else { v == value };
                 let hot = pill.contains(mouse);
                 if on {
                     round_rect(*pill, R_CHIP, INK);
@@ -3249,7 +3377,7 @@ impl App {
             ("TAB", "Switch rail / grid"),
             ("TYPE", "Search; ← → step through matches, ESC clears"),
             ("F5", "Rescan the music folder"),
-            ("CTRL+,", "Settings"),
+            ("CTRL+,  F2", "Settings"),
             ("F11", "Fullscreen"),
             ("CLICK", "Play a tape or track"),
             ("MIDDLE-CLICK", "Queue (with SHIFT: play next)"),
@@ -3647,6 +3775,20 @@ impl App {
         if let Some((_, first)) = views.first() {
             let w = self.fonts.width("VIEW", 10.0, false);
             self.fonts.draw("VIEW", first.x - w - 8.0, first.y + 13.0, 10.0, DIM, false);
+            // Gear: a ring with eight teeth and a hole.
+            let gear = self.gear_button(lay);
+            let c = gear.center();
+            let hot = gear.contains(mouse_position().into());
+            let ink = if hot { INK } else { DIM };
+            for k in 0..8 {
+                let a = k as f32 * PI / 4.0;
+                let (dir, n) = (vec2(a.cos(), a.sin()), vec2(-a.sin(), a.cos()));
+                let (p0, p1) = (c + dir * 5.0, c + dir * 8.5);
+                draw_triangle(p0 - n * 1.6, p0 + n * 1.6, p1 + n * 1.2, ink);
+                draw_triangle(p0 - n * 1.6, p1 + n * 1.2, p1 - n * 1.2, ink);
+            }
+            draw_circle(c.x, c.y, 6.0, ink);
+            draw_circle(c.x, c.y, 2.5, BLACK);
         }
         for (view, r) in views {
             let on = view == self.view;
@@ -4667,7 +4809,7 @@ enum Field {
     KeyRepeat,
     PlayingFps,
     IdleFps,
-    Rescan,
+    MusicFolder,
     Hints,
 }
 
@@ -4689,11 +4831,51 @@ const FIELDS: [(&str, Field, &str); 18] = [
     ("MOTION", Field::KeyRepeat, "Held key repeat"),
     ("PERFORMANCE", Field::PlayingFps, "Frame rate while playing"),
     ("PERFORMANCE", Field::IdleFps, "Frame rate when idle"),
-    ("LIBRARY", Field::Rescan, "Music folder"),
+    ("LIBRARY", Field::MusicFolder, "Music folder"),
     ("LIBRARY", Field::Hints, "Control hints"),
 ];
 
 const OFF_ON: [&str; 2] = ["OFF", "ON"];
+
+/// Fields whose choices are buttons that do something, not values.
+fn is_action(field: Field) -> bool {
+    matches!(field, Field::MusicFolder | Field::Hints)
+}
+
+/// A typed path with a leading `~` meaning the home folder.
+fn expand_home(path: &str) -> PathBuf {
+    match path.strip_prefix('~') {
+        Some(rest) => dirs::home_dir().unwrap_or_default().join(rest.trim_start_matches('/')),
+        None => PathBuf::from(path),
+    }
+}
+
+/// Completes the last part of a typed folder path as far as the folders
+/// there agree, adding the slash once only one is left.
+fn complete_dir(typed: &str) -> String {
+    let (dir, start) = match typed.rfind('/') {
+        Some(k) => (&typed[..=k], &typed[k + 1..]),
+        None => ("", typed),
+    };
+    let Ok(entries) = std::fs::read_dir(expand_home(if dir.is_empty() { "." } else { dir })) else { return typed.to_string() };
+    let names: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with(start) && (start.starts_with('.') || !n.starts_with('.')))
+        .collect();
+    match names.as_slice() {
+        [] => typed.to_string(),
+        [one] => format!("{dir}{one}/"),
+        many => {
+            let first = &many[0];
+            let common = (0..first.len())
+                .take_while(|&k| first.is_char_boundary(k + 1) && many.iter().all(|n| n.get(..=k) == first.get(..=k)))
+                .count();
+            format!("{dir}{}", &first[..common])
+        }
+    }
+}
 /// Height of a line in the settings panel.
 const SETTINGS_ROW: f32 = 30.0;
 
@@ -4784,24 +4966,30 @@ fn fmt_time(s: f32) -> String {
     format!("{:02}:{:02}", s / 60, s % 60)
 }
 
-fn music_dir() -> PathBuf {
+/// The music folder: MUSIC_DIR, else the one chosen in the settings, else
+/// the system's music folder.
+fn music_dir(chosen: Option<&PathBuf>) -> PathBuf {
     std::env::var_os("MUSIC_DIR")
         .map(PathBuf::from)
+        .or_else(|| chosen.filter(|p| p.is_dir()).cloned())
         .or_else(dirs::audio_dir)
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join("Music"))
 }
 
 #[macroquad::main(window_conf)]
 async fn main() {
-    let root = music_dir();
-    let albums = library::scan(&root);
-    eprintln!("[tapedeck] {} tapes from {}", albums.len(), root.display());
-    if albums.is_empty() {
-        eprintln!("[tapedeck] no audio found; set MUSIC_DIR");
-        return;
-    }
     let saved = load_saved();
-    let mut app = App::new(albums, saved, root);
+    let root = music_dir(saved.music_dir.as_ref());
+    let (albums, lyric_dirs) = library::scan(&root);
+    eprintln!("[tapedeck] {} tapes from {}", albums.len(), root.display());
+    for dir in &lyric_dirs {
+        eprintln!("[tapedeck] lyrics from {}", dir.display());
+    }
+    if albums.is_empty() {
+        // The settings (Ctrl+, or F2) can point it at another folder.
+        eprintln!("[tapedeck] no audio found; choose a music folder in the settings or set MUSIC_DIR");
+    }
+    let mut app = App::new(albums, lyric_dirs, saved, root);
     prevent_quit();
 
     // Debug aid: TAPEDECK_SCREENSHOT=out.png renders a few seconds, saves a frame and exits.
@@ -4886,5 +5074,32 @@ async fn main() {
         if profile {
             spent[7] += swap.elapsed().as_secs_f64();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_folders_complete_as_far_as_they_agree() {
+        let root = std::env::temp_dir().join(format!("tapedeck-complete-{}", std::process::id()));
+        for d in ["Music", "Musicals", "Podcasts", ".hidden"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let base = format!("{}/", root.display());
+        assert_eq!(complete_dir(&format!("{base}Mus")), format!("{base}Music"));
+        assert_eq!(complete_dir(&format!("{base}Musica")), format!("{base}Musicals/"));
+        assert_eq!(complete_dir(&format!("{base}P")), format!("{base}Podcasts/"));
+        assert_eq!(complete_dir(&format!("{base}Z")), format!("{base}Z"));
+        assert_eq!(complete_dir(&format!("{base}.h")), format!("{base}.hidden/"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn home_is_expanded_in_typed_paths() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_home("~/Music"), home.join("Music"));
+        assert_eq!(expand_home("/srv/music"), PathBuf::from("/srv/music"));
     }
 }

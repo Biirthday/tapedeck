@@ -2,6 +2,7 @@
   "name": "tapedeck",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Cassette-style player for the local music library",
   "scripts": {

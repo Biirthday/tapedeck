@@ -14,7 +14,6 @@ const ROOT = path.dirname(new URL(import.meta.url).pathname);
 const MUSIC = path.resolve(process.env.MUSIC_DIR || path.join(os.homedir(), 'Music'));
 const PORT = Number(process.env.PORT || 4747);
 const CACHE = path.join(ROOT, '.cache');
-const SKIP_DIRS = new Set(['1.lyrics']);
 const AUDIO = new Set(['.flac', '.mp3', '.m4a', '.ogg', '.opus', '.wav']);
 const COVER_NAMES = ['folder.jpg', 'cover.jpg', 'front.jpg', 'folder.png', 'cover.png'];
 const MIME = {
@@ -45,7 +44,7 @@ async function walk(dir, out = []) {
   const files = [];
   for (const e of entries) {
     if (e.isDirectory()) {
-      if (!SKIP_DIRS.has(e.name) && !e.name.startsWith('.')) await walk(path.join(dir, e.name), out);
+      if (!e.name.startsWith('.')) await walk(path.join(dir, e.name), out);
     } else if (AUDIO.has(path.extname(e.name).toLowerCase())) {
       files.push(e.name);
     }

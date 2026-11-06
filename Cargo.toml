@@ -2,6 +2,10 @@
 name = "tapedeck"
 version = "0.1.0"
 edition = "2024"
+description = "Cassette-wall music player for a local library, with bit-perfect playback"
+readme = "README.md"
+license = "MIT"
+authors = ["LLC171 <privacy@llc171.anonaddy.me>"]
 
 [dependencies]
 dirs = "7.0.0"
@@ -12,3 +16,5 @@ rodio = { version = "0.23.0", default-features = false, features = ["playback", 
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 souvlaki = { version = "0.9.3", default-features = false, features = ["use_zbus"] }
+zbus = "5.19.0"
+zvariant = "5.15.1"

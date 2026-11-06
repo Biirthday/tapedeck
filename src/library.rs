@@ -16,7 +16,6 @@ use lofty::probe::Probe;
 // Only formats the bundled decoders (symphonia) can play. Opus is not among
 // them, so .opus files are left out rather than listed and failing.
 const AUDIO_EXT: &[&str] = &["flac", "mp3", "m4a", "ogg", "wav"];
-const LYRICS_DIR: &str = "1.lyrics";
 const COVER_NAMES: &[&str] = &[
     "folder.jpg", "cover.jpg", "front.jpg", "folder.png", "cover.png",
     "Folder.jpg", "Cover.jpg", "Front.jpg", "Folder.png", "Cover.png",
@@ -47,9 +46,12 @@ pub struct Album {
     pub mix: Option<u64>,
 }
 
-pub fn scan(root: &Path) -> Vec<Album> {
+/// The library under `root`, sorted by artist and year, and the lyrics
+/// folders found there (see `lyric_mirrors`).
+pub fn scan(root: &Path) -> (Vec<Album>, Vec<PathBuf>) {
+    let mirrors = lyric_mirrors(root);
     let mut groups = Vec::new();
-    walk(root, &mut groups);
+    walk(root, &mirrors, &mut groups);
     let mut albums: Vec<Album> = groups
         .into_iter()
         .map(|(dir, files)| {
@@ -62,14 +64,49 @@ pub fn scan(root: &Path) -> Vec<Album> {
     albums.sort_by(|a, b| {
         icase_cmp(&a.artist, &b.artist).then_with(|| a.year.cmp(&b.year))
     });
-    albums
+    (albums, mirrors)
+}
+
+/// Folders at the top of the library that hold `.lrc` files and no audio:
+/// lyrics kept apart from the music, mirroring its paths. Whatever they are
+/// called, they are searched for lyrics and left out of the tapes.
+pub fn lyric_mirrors(root: &Path) -> Vec<PathBuf> {
+    // (has audio, has lyrics), stopping at the first audio file.
+    fn look(dir: &Path, lyrics: &mut bool) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else { return false };
+        let mut subdirs = Vec::new();
+        for e in entries.flatten() {
+            let path = e.path();
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                subdirs.push(path);
+            } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if AUDIO_EXT.iter().any(|a| ext.eq_ignore_ascii_case(a)) {
+                    return true;
+                }
+                *lyrics |= ext.eq_ignore_ascii_case("lrc");
+            }
+        }
+        subdirs.iter().any(|d| look(d, lyrics))
+    }
+    let Ok(entries) = std::fs::read_dir(root) else { return Vec::new() };
+    let mut mirrors: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()) && !e.file_name().to_string_lossy().starts_with('.'))
+        .map(|e| e.path())
+        .filter(|d| {
+            let mut lyrics = false;
+            !look(d, &mut lyrics) && lyrics
+        })
+        .collect();
+    mirrors.sort();
+    mirrors
 }
 
 pub fn icase_cmp(a: &str, b: &str) -> Ordering {
     a.chars().flat_map(char::to_lowercase).cmp(b.chars().flat_map(char::to_lowercase))
 }
 
-fn walk(dir: &Path, out: &mut Vec<(PathBuf, Vec<String>)>) {
+fn walk(dir: &Path, skip: &[PathBuf], out: &mut Vec<(PathBuf, Vec<String>)>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut files = Vec::new();
     let mut subdirs = Vec::new();
@@ -77,7 +114,7 @@ fn walk(dir: &Path, out: &mut Vec<(PathBuf, Vec<String>)>) {
         let name = e.file_name().to_string_lossy().into_owned();
         let Ok(kind) = e.file_type() else { continue };
         if kind.is_dir() {
-            if !name.starts_with('.') && name != LYRICS_DIR {
+            if !name.starts_with('.') && !skip.contains(&e.path()) {
                 subdirs.push(e.path());
             }
         } else if let Some(ext) = Path::new(&name).extension().and_then(|e| e.to_str()) {
@@ -91,7 +128,7 @@ fn walk(dir: &Path, out: &mut Vec<(PathBuf, Vec<String>)>) {
         out.push((dir.to_path_buf(), files));
     }
     for d in subdirs {
-        walk(&d, out);
+        walk(&d, skip, out);
     }
 }
 
@@ -205,10 +242,13 @@ pub enum Lyrics {
     Plain(Vec<String>),
 }
 
-pub fn read_lyrics(track: &Track, root: &Path) -> Option<Lyrics> {
+/// Lyrics for a track: a `.lrc` next to it, or at the same path inside one
+/// of the library's lyrics folders.
+pub fn read_lyrics(track: &Track, root: &Path, mirrors: &[PathBuf]) -> Option<Lyrics> {
     let sidecar = track.path.with_extension("lrc");
-    let mirrored = sidecar.strip_prefix(root).ok().map(|path| root.join(LYRICS_DIR).join(path));
-    [Some(sidecar), mirrored].into_iter().flatten().find_map(|path| {
+    let rel = sidecar.strip_prefix(root).ok().map(Path::to_path_buf);
+    let mirrored = mirrors.iter().filter_map(|m| Some(m.join(rel.as_ref()?)));
+    std::iter::once(sidecar.clone()).chain(mirrored).find_map(|path| {
         let text = std::fs::read_to_string(path).ok()?;
         parse_lyrics(&text)
     })
@@ -332,4 +372,29 @@ fn load_cover(idx: usize, dir: &Path, first: &Path) -> Option<Cover> {
         blur: blur.into_raw(),
         average: [(sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lyrics_folders_are_found_by_content_not_name() {
+        let root = std::env::temp_dir().join(format!("tapedeck-mirrors-{}", std::process::id()));
+        let touch = |p: &str| {
+            let p = root.join(p);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"").unwrap();
+        };
+        touch("Artist/Album/01 Song.flac");
+        touch("Artist/Album/01 Song.lrc");
+        touch("Letras/Artist/Album/01 Song.lrc");
+        touch("Notes/readme.txt");
+        touch(".hidden/Artist/x.lrc");
+        assert_eq!(lyric_mirrors(&root), vec![root.join("Letras")]);
+        let (albums, mirrors) = scan(&root);
+        assert_eq!(albums.len(), 1);
+        assert_eq!(mirrors, vec![root.join("Letras")]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
