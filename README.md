@@ -2,6 +2,8 @@
 
 **A cassette-wall music player for your local library.**
 
+![Tapedeck: the shelf of tapes, the side list and the cassette deck](docs/screenshot.webp)
+
 Tapedeck turns every album folder into a cassette on a 3D shelf. Pick one and
 it is pulled from the rail, turned toward you, and dropped into a cassette
 deck, where its reels wind from one side to the other as the music plays.
