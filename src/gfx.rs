@@ -102,6 +102,8 @@ pub struct Fonts {
     /// Measured widths by a hash of text, size and weight: the same labels
     /// are measured every frame, and measuring walks every glyph.
     widths: std::cell::RefCell<std::collections::HashMap<u64, f32, FxBuild>>,
+    /// Truncated strings from `fit`, cached by text, size, weight and max width.
+    fitted: std::cell::RefCell<std::collections::HashMap<u64, String, FxBuild>>,
     /// A clear pixel drawn to move texture slot 0 off the font atlases; see `prepare`.
     spare: Texture2D,
 }
@@ -119,15 +121,35 @@ fn system_font(pattern: &str) -> Option<Rc<Face>> {
 
 impl Fonts {
     pub fn load() -> Self {
+        let regular = system_font("JetBrains Mono:style=Regular").or_else(|| system_font("monospace"));
+        let bold = system_font("JetBrains Mono:style=Bold").or_else(|| system_font("monospace:bold"));
+        // Many titles are Japanese or Korean.
+        let cjk = system_font("Noto Sans CJK JP:style=Bold");
+        let mut cached = HashSet::default();
+        let mut warm: Vec<char> = (' '..='~').collect();
+        warm.extend(['·', '…', '←', '→', '↑', '↓', 'µ', '×']);
+        for (face, sizes) in [
+            (&regular, &[8u16, 10, 11, 12, 13, 14, 15, 16][..]),
+            (&bold, &[9u16, 10, 11, 12, 13, 15, 16, 17, 18, 20, 21, 23, 24, 25, 32][..]),
+        ] {
+            if let Some(f) = face {
+                let id = &f.font as *const Font as usize;
+                let glyphs: Vec<char> = warm.iter().copied().filter(|&c| f.has(c)).collect();
+                for &size in sizes {
+                    f.font.populate_font_cache(&glyphs, size);
+                    cached.extend(glyphs.iter().map(|&c| (id, c, size)));
+                }
+            }
+        }
         Self {
-            regular: system_font("JetBrains Mono:style=Regular").or_else(|| system_font("monospace")),
-            bold: system_font("JetBrains Mono:style=Bold").or_else(|| system_font("monospace:bold")),
-            // Many titles are Japanese or Korean.
-            cjk: system_font("Noto Sans CJK JP:style=Bold"),
+            regular,
+            bold,
+            cjk,
             fallbacks: Default::default(),
             searched: Default::default(),
-            cached: Default::default(),
+            cached: std::cell::RefCell::new(cached),
             widths: Default::default(),
+            fitted: Default::default(),
             spare: Texture2D::from_rgba8(1, 1, &[0; 4]),
         }
     }
@@ -150,7 +172,7 @@ impl Fonts {
         let Some(font) = font else { return };
         let id = font as *const Font as usize;
         let mut cached = self.cached.borrow_mut();
-        let missing: Vec<char> = text.chars().filter(|&c| !cached.contains(&(id, c, size))).collect();
+        let missing: Vec<char> = text.chars().filter(|&c| cached.insert((id, c, size))).collect();
         if missing.is_empty() {
             return;
         }
@@ -158,7 +180,6 @@ impl Fonts {
         push_camera_state();
         pop_camera_state();
         font.populate_font_cache(&missing, size);
-        cached.extend(missing.into_iter().map(|c| (id, c, size)));
     }
 
     fn pick(&self, text: &str, bold: bool) -> Option<&Rc<Face>> {
@@ -319,6 +340,13 @@ impl Fonts {
         if self.width(text, size, bold) <= max {
             return text.to_string();
         }
+        use std::hash::{Hash, Hasher};
+        let mut h = Fx::default();
+        (text, size as u16, bold, (max * 2.0) as i32).hash(&mut h);
+        let key = h.finish();
+        if let Some(s) = self.fitted.borrow().get(&key) {
+            return s.clone();
+        }
         let ends: Vec<usize> = text.char_indices().skip(1).map(|(i, _)| i).collect();
         let mut lo = 0usize;
         let mut hi = ends.len();
@@ -335,12 +363,35 @@ impl Fonts {
             }
         }
         if lo == 0 {
-            return String::new();
+            buf.clear();
+        } else {
+            buf.clear();
+            buf.push_str(&text[..ends[lo - 1]]);
+            buf.push('…');
         }
-        buf.clear();
-        buf.push_str(&text[..ends[lo - 1]]);
-        buf.push('…');
+        let mut fitted = self.fitted.borrow_mut();
+        if fitted.len() > 8_000 {
+            fitted.clear();
+        }
+        fitted.insert(key, buf.clone());
         buf
+    }
+
+    /// Picks the largest font size in `min..=max` where `text` fits in `max_w`
+    /// without rasterizing intermediate sizes that will not be drawn.
+    pub fn fit_size(&self, text: &str, min: u16, max: u16, bold: bool, max_w: f32) -> f32 {
+        if text.is_empty() {
+            return max as f32;
+        }
+        let w_min = self.width(text, min as f32, bold);
+        if w_min >= max_w || w_min <= 0.0 {
+            return min as f32;
+        }
+        let mut s = ((min as f32 * max_w / w_min).floor() as u16).clamp(min, max);
+        while s > min && self.width(text, s as f32, bold) > max_w {
+            s -= 1;
+        }
+        s as f32
     }
 }
 
@@ -512,11 +563,75 @@ pub fn render_face(
     year: &str,
     style: FaceStyle,
 ) {
+    let paper = style == FaceStyle::Blank || (style == FaceStyle::Mix && covers.is_empty());
+    let label = Rect::new(22.0, 18.0, FACE_W - 44.0, 214.0);
+    let header = Rect::new(label.x, label.y, label.w, HEADER_H);
+    let band = Rect::new(label.x, label.bottom() - BAND_H, label.w, BAND_H);
+    let win = Rect::new(FACE_W / 2.0 - 132.0, 104.0, 264.0, 78.0);
+    let mut labels = Vec::with_capacity(11);
+    let mut print = |text: &str, x: f32, y: f32, size: f32, color: Color, bold: bool| {
+        labels.push((text.to_owned(), x, y, size as u16, color, bold));
+    };
+
+    if !paper {
+        let ink = Color::from_rgba(28, 34, 70, 255);
+        let side = Rect::new(header.x + 12.0, header.y + 12.0, 30.0, 30.0);
+        print("A", side.center().x - fonts.width("A", 20.0, true) / 2.0, side.y + 23.0, 20.0, ink, true);
+        let yw = fonts.width(year, 13.0, false);
+        print(year, header.right() - 14.0 - yw, header.y + 17.0, 13.0, Color::from_rgba(60, 66, 100, 255), false);
+        let tx = header.x + 52.0;
+        let width = header.right() - 14.0 - yw - 12.0 - tx;
+        let title = title.to_uppercase();
+        let size = fonts.fit_size(&title, 18, 24, true, width);
+        print(&fonts.fit(&title, size, true, width), tx, header.y + 34.0, size, ink, true);
+        let by = fonts.fit(&artist.to_uppercase(), 12.0, true, header.w - 66.0);
+        print(&by, tx, header.y + 54.0, 12.0, Color::from_rgba(60, 66, 100, 255), true);
+
+        // Foot band: tape type and length, dark on the band's color.
+        let dark = Color::new(0.0, 0.0, 0.0, 0.82);
+        let base = band.y + band.h - 7.0;
+        print("C-60", band.x + 14.0, base, 17.0, dark, true);
+        let x = band.x + 14.0 + fonts.width("C-60", 17.0, true) + 12.0;
+        print("60 MIN  ·  30 MIN PER SIDE", x, base - 1.0, 10.0, dark, true);
+        let ty = "TYPE I  NORMAL";
+        print(ty, band.right() - 14.0 - fonts.width(ty, 10.0, true), base - 1.0, 10.0, dark, true);
+    } else {
+        // Printed text: title and artist over the art.
+        let (ink, sub, shadow) = if paper {
+            (Color::from_rgba(28, 34, 70, 255), Color::from_rgba(60, 66, 100, 255), Color::new(0.0, 0.0, 0.0, 0.0))
+        } else {
+            (WHITE, Color::from_rgba(227, 227, 220, 255), Color::new(0.0, 0.0, 0.0, 0.75))
+        };
+        let tx = label.x + 16.0;
+        let title = title.to_uppercase();
+        let title_width = label.w - if style == FaceStyle::Blank { 80.0 } else { 32.0 };
+        let title_size = fonts.fit_size(&title, 25, 32, true, title_width);
+        let text = fonts.fit(&title, title_size, true, title_width);
+        print(&text, tx, label.y + 37.0, title_size, ink, true);
+        let by = fonts.fit(artist, 21.0, true, label.w - 32.0);
+        print(&by, tx, label.y + 62.0, 21.0, sub, true);
+
+        // Side badge and year along the label's foot.
+        let foot = label.bottom() - 14.0;
+        let a_color = if paper { Color::from_rgba(236, 231, 216, 255) } else { BLACK };
+        print("A", tx + 10.0 - fonts.width("A", 15.0, true) / 2.0, foot, 15.0, a_color, true);
+        let yw = fonts.width(year, 15.0, false);
+        print(year, label.right() - 16.0 - yw + 1.0, foot + 1.0, 15.0, shadow, false);
+        print(year, label.right() - 16.0 - yw, foot, 15.0, sub, false);
+    }
+    let scale = Color::new(1.0, 1.0, 1.0, 0.55);
+    for (k, text) in [(-6, "30"), (0, "0"), (6, "30")] {
+        let x = win.center().x + k as f32 * 6.0 - fonts.width(text, 8.0, false) / 2.0;
+        print(text, x, win.y + 24.0, 8.0, scale, false);
+    }
+    for (text, _, _, font_size, _, bold) in &labels {
+        fonts.prepare_text(text, *font_size, *bold);
+    }
+
     let mut cam = Camera2D::from_display_rect(Rect::new(0.0, 0.0, FACE_W, FACE_H));
     cam.render_target = Some(target.clone());
     set_camera(&cam);
     clear_background(Color::new(0.0, 0.0, 0.0, 0.0));
-    let paper = style == FaceStyle::Blank || (style == FaceStyle::Mix && covers.is_empty());
     // Stable per-tape variation (how much tape is on each reel).
     let seed = title.bytes().fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
     let wound = (seed % 1000) as f32 / 1000.0;
@@ -532,7 +647,6 @@ pub fn render_face(
     round_rect_lines(Rect::new(2.0, 2.0, FACE_W - 4.0, FACE_H - 4.0), FACE_RADIUS - 2.0, 2.0, Color::new(0.0, 0.0, 0.0, 0.6));
 
     // Label, nearly edge to edge, with rounded corners like printed card.
-    let label = Rect::new(22.0, 18.0, FACE_W - 44.0, 214.0);
     round_rect(Rect::new(label.x - 2.0, label.y - 2.0, label.w + 4.0, label.h + 4.0), 9.0, Color::from_rgba(4, 4, 5, 255));
     match (style, covers) {
         (FaceStyle::Blank, _) | (FaceStyle::Mix, []) => {
@@ -563,8 +677,6 @@ pub fn render_face(
     // Album labels follow a classic C-60 layout: a paper strip across the
     // top to write the title on, the art behind the window, and a printed
     // band at the foot with the tape's type and length.
-    let header = Rect::new(label.x, label.y, label.w, HEADER_H);
-    let band = Rect::new(label.x, label.bottom() - BAND_H, label.w, BAND_H);
     if !paper {
         draw_rectangle(header.x, header.y, header.w, header.h, PAPER);
         draw_rectangle(header.x, header.bottom(), header.w, 2.0, Color::from_rgba(4, 4, 5, 255));
@@ -576,6 +688,11 @@ pub fn render_face(
         for k in 0..3 {
             draw_rectangle(band.x, band.y + 4.0 + k as f32 * 3.0, band.w, 1.0, Color::new(0.0, 0.0, 0.0, 0.18));
         }
+        let side = Rect::new(header.x + 12.0, header.y + 12.0, 30.0, 30.0);
+        draw_rectangle_lines(side.x, side.y, side.w, side.h, 2.0, Color::from_rgba(28, 34, 70, 255));
+    } else {
+        let ink = if paper { Color::from_rgba(28, 34, 70, 255) } else { WHITE };
+        draw_circle(label.x + 26.0, label.bottom() - 19.0, 11.0, ink);
     }
     // Rounded label corners: cut back to shell color.
     for (corner, start) in [
@@ -592,61 +709,7 @@ pub fn render_face(
         }
     }
 
-    if !paper {
-        let ink = Color::from_rgba(28, 34, 70, 255);
-        // Side box on the left of the strip, year on the right.
-        let side = Rect::new(header.x + 12.0, header.y + 12.0, 30.0, 30.0);
-        draw_rectangle_lines(side.x, side.y, side.w, side.h, 2.0, ink);
-        fonts.draw("A", side.center().x - fonts.width("A", 20.0, true) / 2.0, side.y + 23.0, 20.0, ink, true);
-        let yw = fonts.width(year, 13.0, false);
-        fonts.draw(year, header.right() - 14.0 - yw, header.y + 17.0, 13.0, Color::from_rgba(60, 66, 100, 255), false);
-        let tx = header.x + 52.0;
-        let width = header.right() - 14.0 - yw - 12.0 - tx;
-        let title = title.to_uppercase();
-        let size = (18..=24).rev().find(|&size| fonts.width(&title, size as f32, true) <= width).unwrap_or(18) as f32;
-        fonts.draw(&fonts.fit(&title, size, true, width), tx, header.y + 34.0, size, ink, true);
-        let by = fonts.fit(&artist.to_uppercase(), 12.0, true, header.w - 66.0);
-        fonts.draw(&by, tx, header.y + 54.0, 12.0, Color::from_rgba(60, 66, 100, 255), true);
-
-        // Foot band: tape type and length, dark on the band's color.
-        let dark = Color::new(0.0, 0.0, 0.0, 0.82);
-        let base = band.y + band.h - 7.0;
-        fonts.draw("C-60", band.x + 14.0, base, 17.0, dark, true);
-        let x = band.x + 14.0 + fonts.width("C-60", 17.0, true) + 12.0;
-        fonts.draw("60 MIN  ·  30 MIN PER SIDE", x, base - 1.0, 10.0, dark, true);
-        let ty = "TYPE I  NORMAL";
-        fonts.draw(ty, band.right() - 14.0 - fonts.width(ty, 10.0, true), base - 1.0, 10.0, dark, true);
-    } else {
-    // Printed text: title and artist over the art.
-    let (ink, sub, shadow) = if paper {
-        (Color::from_rgba(28, 34, 70, 255), Color::from_rgba(60, 66, 100, 255), Color::new(0.0, 0.0, 0.0, 0.0))
-    } else {
-        (WHITE, Color::from_rgba(227, 227, 220, 255), Color::new(0.0, 0.0, 0.0, 0.75))
-    };
-    let tx = label.x + 16.0;
-    let title = title.to_uppercase();
-    let title_width = label.w - if style == FaceStyle::Blank { 80.0 } else { 32.0 };
-    let title_size = (25..=32)
-        .rev()
-        .find(|&size| fonts.width(&title, size as f32, true) <= title_width)
-        .unwrap_or(25) as f32;
-    let text = fonts.fit(&title, title_size, true, title_width);
-    fonts.draw(&text, tx, label.y + 37.0, title_size, ink, true);
-    let by = fonts.fit(artist, 21.0, true, label.w - 32.0);
-    fonts.draw(&by, tx, label.y + 62.0, 21.0, sub, true);
-
-    // Side badge and year along the label's foot.
-    let foot = label.bottom() - 14.0;
-    draw_circle(tx + 10.0, foot - 5.0, 11.0, ink);
-    let a_color = if paper { Color::from_rgba(236, 231, 216, 255) } else { BLACK };
-    fonts.draw("A", tx + 10.0 - fonts.width("A", 15.0, true) / 2.0, foot, 15.0, a_color, true);
-    let yw = fonts.width(year, 15.0, false);
-    fonts.draw(year, label.right() - 16.0 - yw + 1.0, foot + 1.0, 15.0, shadow, false);
-    fonts.draw(year, label.right() - 16.0 - yw, foot, 15.0, sub, false);
-    }
-
     // Window: smoked plastic over two reels and the tape between them.
-    let win = Rect::new(FACE_W / 2.0 - 132.0, 104.0, 264.0, 78.0);
     round_rect(Rect::new(win.x - 4.0, win.y - 4.0, win.w + 8.0, win.h + 8.0), 43.0, Color::from_rgba(4, 4, 5, 255));
     round_rect(win, 39.0, Color::from_rgba(16, 16, 19, 255));
     let (lc, rc) = (vec2(win.x + 50.0, win.center().y), vec2(win.right() - 50.0, win.center().y));
@@ -664,15 +727,10 @@ pub fn render_face(
         draw_circle(x, win.bottom() - 11.0, 1.8, Color::from_rgba(60, 60, 64, 255));
     }
     // Printed minute scale between the reels, 0 to 30 each way from the middle.
-    let scale = Color::new(1.0, 1.0, 1.0, 0.55);
     for k in -6..=6 {
         let x = win.center().x + k as f32 * 6.0;
         let tall = k % 2 == 0;
         draw_rectangle(x - 0.5, win.y + 8.0, 1.0, if tall { 7.0 } else { 4.0 }, scale);
-    }
-    for (k, label) in [(-6, "30"), (0, "0"), (6, "30")] {
-        let x = win.center().x + k as f32 * 6.0 - fonts.width(label, 8.0, false) / 2.0;
-        fonts.draw(label, x, win.y + 24.0, 8.0, scale, false);
     }
     // Glass: a soft reflection along the top and a rim.
     draw_rectangle(win.x + 30.0, win.y + 6.0, win.w - 60.0, 5.0, Color::new(1.0, 1.0, 1.0, 0.09));
@@ -711,6 +769,14 @@ pub fn render_face(
 
     for (x, y) in [(13.0, 13.0), (FACE_W - 13.0, 13.0), (13.0, FACE_H - 13.0), (FACE_W - 13.0, FACE_H - 13.0), (FACE_W / 2.0, FACE_H - 50.0)] {
         screw(x, y, 5.5);
+    }
+
+    for pass_bold in [true, false] {
+        for (text, x, y, font_size, color, bold) in &labels {
+            if *bold == pass_bold {
+                fonts.draw_scaled(text, *x, *y, *font_size, 1.0, *color, *bold);
+            }
+        }
     }
 
     // Gloss: a faint diagonal sheen across the whole front.

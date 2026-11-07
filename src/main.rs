@@ -1580,11 +1580,12 @@ impl App {
     /* ---------- Per-frame update ---------- */
 
     fn receive_covers(&mut self) {
-        const COVERS_PER_FRAME: usize = 6;
+        let scrolling = (self.target - self.scroll).abs() > 0.02 || (self.grid_target - self.grid_scroll).abs() > 1.0;
+        let limit = if scrolling { 2 } else { 6 };
         let workers_finished = self.covers_done.load(Ordering::Acquire) >= self.cover_jobs;
         let mut received = 0;
         let mut loaded_dirs = Vec::new();
-        let incoming: Vec<Cover> = self.covers.try_iter().chain(self.extra_covers.iter().flat_map(|rx| rx.try_iter())).take(COVERS_PER_FRAME).collect();
+        let incoming: Vec<Cover> = self.covers.try_iter().chain(self.extra_covers.iter().flat_map(|rx| rx.try_iter())).take(limit).collect();
         for cover in incoming {
             received += 1;
             let Some(i) = self.index_of(cover.idx) else { continue };
@@ -1611,7 +1612,7 @@ impl App {
             }
         }
         // Once every cover is in, cache the colors and settle the color sort.
-        if !self.colors_saved && workers_finished && received < COVERS_PER_FRAME {
+        if !self.colors_saved && !scrolling && workers_finished && received < limit {
             self.colors_saved = true;
             let colors: HashMap<&str, [u8; 3]> = self
                 .albums
@@ -1650,34 +1651,73 @@ impl App {
         out
     }
 
+    fn render_tape_face(&mut self, i: usize) {
+        let (covers, style) = match self.albums[i].mix {
+            Some(0) => (Vec::new(), FaceStyle::Blank),
+            Some(_) => (self.mix_covers(i), FaceStyle::Mix),
+            None => (self.tapes[i].cover.iter().cloned().collect(), FaceStyle::Album),
+        };
+        let tape = &mut self.tapes[i];
+        let target = tape.face.get_or_insert_with(|| self.face_pool.pop().unwrap_or_else(|| face_target(1.0)));
+        let album = &self.albums[i];
+        let stripe = accent_color(tape.average);
+        gfx::render_face(target, &self.fonts, &covers, tape.shell, stripe, &album.album, &album.artist, &album.year, style);
+        tape.dirty = false;
+    }
+
+    fn has_dirty_kept_face(&self) -> bool {
+        let keep = (VISIBLE.0 - 96.0)..=(VISIBLE.1 + 96.0);
+        let all_loaded = self.covers_done.load(Ordering::Acquire) >= self.cover_jobs;
+        self.tapes.iter().enumerate().any(|(i, t)| {
+            t.dirty
+                && keep.contains(&(i as f32 - self.scroll))
+                && (all_loaded || self.albums[i].mix.is_some() || t.cover.is_some())
+        })
+    }
+
     fn render_faces(&mut self) {
-        let keep = (VISIBLE.0 - 12.0)..=(VISIBLE.1 + 12.0);
+        let keep = (VISIBLE.0 - 96.0)..=(VISIBLE.1 + 96.0);
         for (i, tape) in self.tapes.iter_mut().enumerate() {
             if tape.face.is_some() && !keep.contains(&(i as f32 - self.scroll)) {
                 self.face_pool.push(tape.face.take().unwrap());
                 tape.dirty = true;
             }
         }
-        let mut budget = FACE_RENDERS_PER_FRAME;
+        let scrolling = (self.target - self.scroll).abs() > 0.02;
+        let mut rendered = 0;
         for i in self.visible() {
-            if budget == 0 {
-                break;
-            }
             if !self.tapes[i].dirty {
                 continue;
             }
-            let (covers, style) = match self.albums[i].mix {
-                Some(0) => (Vec::new(), FaceStyle::Blank),
-                Some(_) => (self.mix_covers(i), FaceStyle::Mix),
-                None => (self.tapes[i].cover.iter().cloned().collect(), FaceStyle::Album),
+            let max_renders = if !scrolling {
+                FACE_RENDERS_PER_FRAME
+            } else if self.tapes[i].face.is_none() {
+                2
+            } else {
+                1
             };
-            let tape = &mut self.tapes[i];
-            let target = tape.face.get_or_insert_with(|| self.face_pool.pop().unwrap_or_else(|| face_target(1.0)));
-            let album = &self.albums[i];
-            let stripe = accent_color(tape.average);
-            gfx::render_face(target, &self.fonts, &covers, tape.shell, stripe, &album.album, &album.artist, &album.year, style);
-            tape.dirty = false;
-            budget -= 1;
+            if rendered >= max_renders {
+                break;
+            }
+            self.render_tape_face(i);
+            rendered += 1;
+        }
+        // Pre-render nearby faces one at a time so they are ready before scrolling into view.
+        if rendered == 0 {
+            let all_loaded = self.covers_done.load(Ordering::Acquire) >= self.cover_jobs;
+            let center = self.target + (VISIBLE.0 + VISIBLE.1) * 0.5;
+            let next = (0..self.tapes.len())
+                .filter(|&i| {
+                    let t = &self.tapes[i];
+                    t.dirty
+                        && keep.contains(&(i as f32 - self.scroll))
+                        && (!scrolling || t.face.is_none())
+                        && (all_loaded || self.albums[i].mix.is_some() || t.cover.is_some())
+                })
+                .min_by(|&a, &b| (a as f32 - center).abs().total_cmp(&(b as f32 - center).abs()));
+            if let Some(i) = next {
+                self.render_tape_face(i);
+            }
         }
 
         // Paint the J-card of a tape that was just turned around.
@@ -1994,8 +2034,9 @@ impl App {
         self.hover = if self.drag.is_some_and(|d| d.2) || self.ruler_drag || self.seek_drag.is_some() || on_controls { None } else { picked };
         // Arrow keys and the wheel move a focus that stands in for the mouse
         // until it moves again. The first frame only records where it is.
+        let move_threshold = if (self.target - self.scroll).abs() > 0.05 { 12.0 } else { 2.0 };
         match self.last_mouse {
-            Some(last) if mouse.distance(last) > 2.0 => {
+            Some(last) if mouse.distance(last) > move_threshold => {
                 self.key_focus = false;
                 self.last_mouse = Some(mouse);
             }
@@ -2398,7 +2439,7 @@ impl App {
     fn frame_budget(&self) -> f32 {
         let now = get_time();
         let recent = |at: f64, span: f64| now - at < span;
-        let busy = recent(self.active_at, 1.5)
+        let busy = recent(self.active_at, 3.0)
             || self.settling
             || recent(self.lyric_change.1, 0.5)
             || recent(self.volume_at, 1.5)
@@ -2407,7 +2448,8 @@ impl App {
             || self.seek_drag.is_some()
             || self.knob_drag.is_some()
             || self.rescan.is_some()
-            || self.visible().any(|i| self.tapes[i].dirty)
+            || !self.colors_saved
+            || self.has_dirty_kept_face()
             || (self.accent.r - self.accent_goal.r).abs() + (self.accent.g - self.accent_goal.g).abs() + (self.accent.b - self.accent_goal.b).abs() > 0.01;
         if busy {
             0.0
@@ -2874,7 +2916,13 @@ impl App {
             }
         }
         self.sync_desktop(dt);
-        if get_time() - self.saved_at > 5.0 && (self.dirty_state || self.audio.is_playing()) {
+        let busy_scrolling = (self.target - self.scroll).abs() > 0.005
+            || (self.grid_target - self.grid_scroll).abs() > 1.0
+            || self.drag.is_some()
+            || self.ruler_drag
+            || self.seek_drag.is_some()
+            || self.knob_drag.is_some();
+        if !busy_scrolling && get_time() - self.saved_at > 5.0 && (self.dirty_state || self.audio.is_playing()) {
             self.save();
         }
     }
@@ -2907,7 +2955,9 @@ impl App {
         // ends whenever the texture changes. So every tape is drawn in passes
         // that share a texture: plain plastic, the ridged edges, the printed
         // faces, and last the clear plastic and highlights, far to near.
-        let mut tapes = Vec::new();
+        let h_y = TAPE.y / 2.0;
+        let has_reflection = self.settings.reflection() > 0.0;
+        let mut tapes = Vec::with_capacity(rail.len());
         for i in rail.rev() {
             let p = i as f32 - self.scroll;
             // The far end of the rail sinks into the dark over a long, eased
@@ -2921,26 +2971,35 @@ impl App {
                 1.0
             }
             .clamp(0.0, 1.0);
-            tapes.push((i, fade));
+            let t = &self.tapes[i];
+            let m = self.tape_matrix(lay, i);
+            let mirror_m = (has_reflection && t.flip < 0.01 && t.out < 0.02).then(|| {
+                let floor = self.rail_matrix(lay, i).w_axis.y - h_y;
+                Mat4::from_translation(vec3(0.0, floor, 0.0))
+                    * Mat4::from_scale(vec3(1.0, -1.0, 1.0))
+                    * Mat4::from_translation(vec3(0.0, -floor, 0.0))
+                    * m
+            });
+            tapes.push((i, fade, m, mirror_m));
         }
         for pass in [Pass::Solid, Pass::Edge, Pass::Face, Pass::Clear] {
-            for &(i, fade) in &tapes {
+            for &(i, fade, ref m, ref mirror_m) in &tapes {
                 let t = &self.tapes[i];
                 // Tapes resting on the rail reflect in the floor; one being turned
                 // around or leaving for the deck has left it.
-                if t.flip < 0.01 && t.out < 0.02 && self.settings.reflection() > 0.0 {
-                    self.draw_tape(lay, i, fade, true, pass);
+                if let Some(mirror_m) = mirror_m {
+                    self.draw_tape(lay, i, mirror_m, fade, true, pass);
                 }
                 // A tape on its way to the deck comes out of the dark of the far
                 // rail into full light, and is gone once it has left the stage.
                 if t.out < 0.999 {
                     let lit = fade + (1.0 - fade) * (t.out * 4.0).min(1.0);
-                    self.draw_tape(lay, i, lit, false, pass);
+                    self.draw_tape(lay, i, m, lit, false, pass);
                 }
             }
         }
         // Gaps are lines, a different draw mode: they get their own batch.
-        for &(i, fade) in &tapes {
+        for &(i, fade, _, _) in &tapes {
             let out = self.tapes[i].out;
             if out > 0.01 {
                 self.draw_gap(lay, i, fade * out);
@@ -3025,6 +3084,23 @@ impl App {
         if self.show_help {
             self.draw_help(lay);
         }
+        let icon = Rect::new(s.right() - SP_L - 36.0, s.bottom() - 36.0, 36.0, 24.0);
+        let body = Rect::new(icon.x + 5.0, icon.y + 4.0, 26.0, 16.0);
+        let pill = self.sfx_pill(lay);
+        round_rect_lines(icon, R_CHIP, 1.5, LINE);
+        round_rect_lines(body, 2.0, 1.2, INK);
+        round_rect_lines(Rect::new(body.x + 5.0, body.y + 4.0, 16.0, 6.0), 3.0, 1.2, INK);
+        if self.sfx {
+            round_rect(pill, R_CHIP, INK);
+        } else {
+            round_rect_lines(pill, R_CHIP, 1.0, Color::new(1.0, 1.0, 1.0, 0.35));
+        }
+        let shown = match self.view {
+            View::Rail => self.scroll.round() as i32 + 2,
+            View::Grid => self.view_span().0 as i32 + 1,
+        };
+        let count = format!("{:03} / {:03}", shown.clamp(1, self.albums.len() as i32), self.albums.len());
+        let cw = self.fonts.width(&count, 12.0, false);
         if self.query.is_empty() {
             let gridded = self.view == View::Grid;
             let hint: String = match self.hover {
@@ -3048,8 +3124,9 @@ impl App {
                     .join("  "),
             };
             // Leave room for the tape counter on the right.
-            let hint = self.fonts.fit(&hint, 12.0, false, self.sfx_pill(lay).x - SP_M - s.x - SP_L);
+            let hint = self.fonts.fit(&hint, 12.0, false, pill.x - SP_M - s.x - SP_L);
             self.fonts.draw(&hint, s.x + SP_L, s.bottom() - 19.0, 12.0, INK, false);
+            self.fonts.draw(&count, icon.x - SP_S - cw, icon.y + 16.0, 12.0, DIM, false);
         } else {
             // Search field, styled like the deck's display.
             let caret = if get_time().fract() < 0.5 { "_" } else { " " };
@@ -3063,30 +3140,11 @@ impl App {
             let field = Rect::new(s.x + 16.0, s.bottom() - 44.0, (tw + sw + 100.0).max(260.0), 28.0);
             round_rect(field, R_BOX, Color::new(0.0, 0.0, 0.0, 0.85));
             round_rect_lines(field, R_BOX, 1.5, LINE);
-            self.fonts.draw("SEARCH", field.x + 10.0, field.y + 18.0, 10.0, DIM, true);
             self.fonts.draw(&text, field.x + 62.0, field.y + 19.0, 14.0, INK, false);
             let color = if self.matches.is_empty() { Color::from_rgba(255, 120, 110, 255) } else { DIM };
             self.fonts.draw(&status, field.right() - 10.0 - sw, field.y + 18.0, 11.0, color, false);
-        }
-
-        let shown = match self.view {
-            View::Rail => self.scroll.round() as i32 + 2,
-            View::Grid => self.view_span().0 as i32 + 1,
-        };
-        let count = format!("{:03} / {:03}", shown.clamp(1, self.albums.len() as i32), self.albums.len());
-        let cw = self.fonts.width(&count, 12.0, false);
-        let icon = Rect::new(s.right() - SP_L - 36.0, s.bottom() - 36.0, 36.0, 24.0);
-        self.fonts.draw(&count, icon.x - SP_S - cw, icon.y + 16.0, 12.0, DIM, false);
-        round_rect_lines(icon, R_CHIP, 1.5, LINE);
-        let body = Rect::new(icon.x + 5.0, icon.y + 4.0, 26.0, 16.0);
-        round_rect_lines(body, 2.0, 1.2, INK);
-        round_rect_lines(Rect::new(body.x + 5.0, body.y + 4.0, 16.0, 6.0), 3.0, 1.2, INK);
-
-        let pill = self.sfx_pill(lay);
-        if self.sfx {
-            round_rect(pill, R_CHIP, INK);
-        } else {
-            round_rect_lines(pill, R_CHIP, 1.0, Color::new(1.0, 1.0, 1.0, 0.35));
+            self.fonts.draw(&count, icon.x - SP_S - cw, icon.y + 16.0, 12.0, DIM, false);
+            self.fonts.draw("SEARCH", field.x + 10.0, field.y + 18.0, 10.0, DIM, true);
         }
         self.fonts.draw("SFX", pill.x + 7.0, pill.y + 13.0, 10.0, if self.sfx { BLACK } else { DIM }, true);
     }
@@ -3546,18 +3604,9 @@ impl App {
     /// Draws a tape, or with `mirror` its reflection in the glossy floor its
     /// rail position stands on: flipped through that floor, dim, and fading
     /// out away from it.
-    fn draw_tape(&self, lay: &Layout, i: usize, fade: f32, mirror: bool, pass: Pass) {
+    fn draw_tape(&self, lay: &Layout, i: usize, m: &Mat4, fade: f32, mirror: bool, pass: Pass) {
         let tape = &self.tapes[i];
         let h = TAPE / 2.0;
-        let m = if mirror {
-            let floor = self.rail_matrix(lay, i).w_axis.y - h.y;
-            Mat4::from_translation(vec3(0.0, floor, 0.0))
-                * Mat4::from_scale(vec3(1.0, -1.0, 1.0))
-                * Mat4::from_translation(vec3(0.0, -floor, 0.0))
-                * self.tape_matrix(lay, i)
-        } else {
-            self.tape_matrix(lay, i)
-        };
         // Reflections are brightest where the tape meets the floor.
         let reflection = self.settings.reflection();
         let gloss = |p: Vec3| if mirror { reflection * (1.0 - (p.y + h.y) / (2.0 * h.y)).clamp(0.0, 1.0).powi(2) } else { 1.0 };
@@ -3606,8 +3655,9 @@ impl App {
                     indices.extend([a0, a1, b1, a0, b1, b0]);
                 }
                 // Back plate as a fan around the center; a turned tape shows its
-                // card through a clear back instead.
-                if !card {
+                // card through a clear back instead. When resting on the rail,
+                // the back plate faces away from the camera behind the front face.
+                if !card && (tape.flip > 0.01 || tape.out > 0.01) {
                     let center = vertices.len() as u16;
                     vertices.push(vert(vec3(0.0, 0.0, -h.z), Vec2::ZERO, [14, 14, 14]));
                     for k in 0..count {
@@ -3615,9 +3665,11 @@ impl App {
                     }
                 }
                 draw_mesh(&Mesh { vertices, indices, texture: None });
-                draw_recess(&m, h.z, face_z, 1.0, shade, &gloss, Recess::Walls);
+                if !mirror {
+                    draw_recess(m, h.z, face_z, 1.0, shade, &gloss, Recess::Walls);
+                }
                 if card {
-                    draw_recess(&m, -h.z, JCARD_Z, -1.0, shade, &|_| 1.0, Recess::Walls);
+                    draw_recess(m, -h.z, JCARD_Z, -1.0, shade, &|_| 1.0, Recess::Walls);
                 }
             }
             Pass::Edge => {
@@ -3658,7 +3710,7 @@ impl App {
                 // inside the rim, strongest at the top right corner and fading
                 // along the edges.
                 if !mirror {
-                    draw_recess(&m, h.z, face_z, 1.0, shade, &gloss, Recess::Glass(self.settings.sheen()));
+                    draw_recess(m, h.z, face_z, 1.0, shade, &gloss, Recess::Glass(self.settings.sheen()));
                     let z = h.z + 0.003;
                     let rim = |p: Vec3, a: f32| {
                         let v = (255.0 * shade) as u8;
@@ -3699,7 +3751,7 @@ impl App {
                         let vertices = vec![corner(row.x, row.y), corner(row.right(), row.y), corner(row.right(), row.bottom()), corner(row.x, row.bottom())];
                         draw_mesh(&Mesh { vertices, indices: vec![0, 1, 2, 0, 2, 3], texture: None });
                     }
-                    draw_recess(&m, -h.z, z, -1.0, shade, &|_| 1.0, Recess::Glass(self.settings.sheen()));
+                    draw_recess(m, -h.z, z, -1.0, shade, &|_| 1.0, Recess::Glass(self.settings.sheen()));
                 }
             }
         }
@@ -3867,9 +3919,8 @@ impl App {
 
     fn draw_sort_pills(&self, lay: &Layout) {
         let views = self.view_pills(lay);
-        if let Some((_, first)) = views.first() {
-            let w = self.fonts.width("VIEW", 10.0, false);
-            self.fonts.draw("VIEW", first.x - w - 8.0, first.y + 13.0, 10.0, DIM, false);
+        let pills = self.sort_pills(lay);
+        if views.first().is_some() {
             // Gear: a ring with eight teeth and a hole.
             let gear = self.gear_button(lay);
             let c = gear.center();
@@ -3885,34 +3936,39 @@ impl App {
             draw_circle(c.x, c.y, 6.0, ink);
             draw_circle(c.x, c.y, 2.5, BLACK);
         }
-        for (view, r) in views {
-            let on = view == self.view;
-            if on {
+        for &(view, r) in &views {
+            if view == self.view {
                 round_rect(r, R_CHIP, INK);
             } else {
                 round_rect_lines(r, R_CHIP, 1.0, Color::new(1.0, 1.0, 1.0, 0.35));
             }
-            self.fonts.draw(view.label(), r.x + 7.0, r.y + 13.0, 10.0, if on { BLACK } else { DIM }, true);
         }
-        let pills = self.sort_pills(lay);
-        if let Some((_, first)) = pills.first() {
-            let w = self.fonts.width("SORT", 10.0, false);
-            self.fonts.draw("SORT", first.x - w - 8.0, first.y + 13.0, 10.0, DIM, false);
-        }
-        for (sort, r) in pills {
-            let on = sort == self.sort;
-            if on {
+        for &(sort, r) in &pills {
+            if sort == self.sort {
                 round_rect(r, R_CHIP, INK);
-            } else {
-                round_rect_lines(r, R_CHIP, 1.0, Color::new(1.0, 1.0, 1.0, 0.35));
-            }
-            self.fonts.draw(sort.label(), r.x + 7.0, r.y + 13.0, 10.0, if on { BLACK } else { DIM }, true);
-            if on {
                 // Up runs low to high (A to Z, oldest first), down high to low.
                 let (cx, cy) = (r.right() - 7.0 - SORT_ARROW / 2.0 + 2.0, r.y + r.h / 2.0);
                 let (tip, foot) = if sort.descends() != self.sort_rev { (3.0, -3.0) } else { (-3.0, 3.0) };
                 draw_triangle(vec2(cx, cy + tip), vec2(cx - 3.5, cy + foot), vec2(cx + 3.5, cy + foot), BLACK);
+            } else {
+                round_rect_lines(r, R_CHIP, 1.0, Color::new(1.0, 1.0, 1.0, 0.35));
             }
+        }
+        if let Some((_, first)) = views.first() {
+            let w = self.fonts.width("VIEW", 10.0, false);
+            self.fonts.draw("VIEW", first.x - w - 8.0, first.y + 13.0, 10.0, DIM, false);
+        }
+        if let Some((_, first)) = pills.first() {
+            let w = self.fonts.width("SORT", 10.0, false);
+            self.fonts.draw("SORT", first.x - w - 8.0, first.y + 13.0, 10.0, DIM, false);
+        }
+        for (view, r) in views {
+            let on = view == self.view;
+            self.fonts.draw(view.label(), r.x + 7.0, r.y + 13.0, 10.0, if on { BLACK } else { DIM }, true);
+        }
+        for (sort, r) in pills {
+            let on = sort == self.sort;
+            self.fonts.draw(sort.label(), r.x + 7.0, r.y + 13.0, 10.0, if on { BLACK } else { DIM }, true);
         }
     }
 
@@ -3984,6 +4040,10 @@ impl App {
                 _ => groups.push((key, x, x)),
             }
         }
+        if let Some(i) = self.current {
+            let x = x_of(i as f32);
+            draw_triangle(vec2(x, base + 2.0), vec2(x - 4.5, base + 8.0), vec2(x + 4.5, base + 8.0), self.accent);
+        }
         // Each label goes at the start of its run, or slides right within the
         // run to clear the one before; a run too short for that goes unlabeled.
         const LABEL_GAP: f32 = 8.0;
@@ -3997,10 +4057,6 @@ impl App {
                 self.fonts.draw(key, x, r.y + 8.0, 10.0, DIM, false);
                 last_label = x + self.fonts.width(key, 10.0, false);
             }
-        }
-        if let Some(i) = self.current {
-            let x = x_of(i as f32);
-            draw_triangle(vec2(x, base + 2.0), vec2(x - 4.5, base + 8.0), vec2(x + 4.5, base + 8.0), self.accent);
         }
 
         // Tooltip naming the tape under the mouse, with its cover when loaded.
@@ -4037,18 +4093,21 @@ impl App {
             gl.quad_gl.scissor(on.then(|| (a.x as i32 - 4, a.y as i32, a.w as i32 + 8, a.h as i32)));
         };
         clip(true);
-        for i in g.visible(self.albums.len(), self.grid_scroll) {
-            let (album, tape) = (&self.albums[i], &self.tapes[i]);
-            let hovered = self.hover == Some(i);
-            let playing = self.current == Some(i);
+        let visible: Vec<usize> = g.visible(self.albums.len(), self.grid_scroll).collect();
+        let cell_rect = |i: usize| {
             let mut c = g.cover(i, self.grid_scroll);
-            if hovered {
+            if self.hover == Some(i) {
                 c.y -= 3.0;
             }
+            c
+        };
+
+        // Pass 1: textured album covers and mixtape collages.
+        for &i in &visible {
+            let (album, tape) = (&self.albums[i], &self.tapes[i]);
+            let c = cell_rect(i);
             let shade = if searching && !tape.matched { 0.22 } else { 1.0 };
             let tint = Color::new(shade, shade, shade, 1.0);
-
-            // Cover: the album art, a collage for mixtapes, or the tape's plastic until it loads.
             let mix = if album.mix.is_some() { self.mix_covers(i) } else { Vec::new() };
             if let Some(tex) = tape.cover.as_ref().filter(|_| album.mix.is_none()) {
                 cover_fit(tex, c, 0.5, tint);
@@ -4058,22 +4117,52 @@ impl App {
                     let r = Rect::new(half.x + (k % 2) as f32 * half.w, half.y + (k / 2) as f32 * half.h, half.w, half.h);
                     cover_fit(&mix[k % mix.len()], r, 0.5, tint);
                 }
-            } else {
+            }
+        }
+
+        // Pass 2: coverless plastic shells and their labels (drawn under hover overlays).
+        let mut any_coverless = false;
+        for &i in &visible {
+            let (album, tape) = (&self.albums[i], &self.tapes[i]);
+            let has_cover = tape.cover.as_ref().filter(|_| album.mix.is_none()).is_some()
+                || (album.mix.is_some() && !self.mix_covers(i).is_empty());
+            if !has_cover {
+                any_coverless = true;
+                let c = cell_rect(i);
+                let shade = if searching && !tape.matched { 0.22 } else { 1.0 };
                 let base = Color { r: tape.shell.r * shade, g: tape.shell.g * shade, b: tape.shell.b * shade, a: 1.0 };
                 draw_rectangle(c.x, c.y, c.w, c.h, base);
-                let label = if album.mix == Some(0) { "+ NEW MIXTAPE".to_string() } else { album.album.to_uppercase() };
-                let lines = f.wrap(&label, 13.0, true, c.w - 24.0, 3);
-                for (k, line) in lines.iter().enumerate() {
-                    f.draw(line, c.x + 12.0, c.y + 26.0 + k as f32 * 17.0, 13.0, Color { a: shade, ..INK }, true);
+            }
+        }
+        if any_coverless {
+            for &i in &visible {
+                let (album, tape) = (&self.albums[i], &self.tapes[i]);
+                let has_cover = tape.cover.as_ref().filter(|_| album.mix.is_none()).is_some()
+                    || (album.mix.is_some() && !self.mix_covers(i).is_empty());
+                if !has_cover {
+                    let c = cell_rect(i);
+                    let shade = if searching && !tape.matched { 0.22 } else { 1.0 };
+                    let label = if album.mix == Some(0) { "+ NEW MIXTAPE".to_string() } else { album.album.to_uppercase() };
+                    let lines = f.wrap(&label, 13.0, true, c.w - 24.0, 3);
+                    for (k, line) in lines.iter().enumerate() {
+                        f.draw(line, c.x + 12.0, c.y + 26.0 + k as f32 * 17.0, 13.0, Color { a: shade, ..INK }, true);
+                    }
                 }
             }
+        }
 
+        // Pass 3: untextured borders, playing badges and hover play buttons.
+        let badge = if self.audio.is_playing() { "PLAYING" } else { "PAUSED" };
+        let bw = f.width(badge, 10.0, true) + 14.0;
+        for &i in &visible {
+            let tape = &self.tapes[i];
+            let hovered = self.hover == Some(i);
+            let playing = self.current == Some(i);
+            let c = cell_rect(i);
+            let shade = if searching && !tape.matched { 0.22 } else { 1.0 };
             if playing {
                 draw_rectangle_lines(c.x - 3.0, c.y - 3.0, c.w + 6.0, c.h + 6.0, 2.0, self.accent);
-                let badge = if self.audio.is_playing() { "PLAYING" } else { "PAUSED" };
-                let bw = f.width(badge, 10.0, true) + 14.0;
                 draw_rectangle(c.x, c.y, bw, 18.0, self.accent);
-                f.draw(badge, c.x + 7.0, c.y + 13.0, 10.0, BLACK, true);
             } else if hovered || focused == Some(i) {
                 draw_rectangle_lines(c.x - 2.0, c.y - 2.0, c.w + 4.0, c.h + 4.0, 1.5, INK);
             } else {
@@ -4086,11 +4175,26 @@ impl App {
                 ring(m.x, m.y, 22.0, 1.5, INK);
                 draw_triangle(m + vec2(-6.0, -9.0), m + vec2(-6.0, 9.0), m + vec2(10.0, 0.0), INK);
             }
+        }
 
+        // Pass 4: bold captions (playing badge + album title).
+        for &i in &visible {
+            let (album, tape) = (&self.albums[i], &self.tapes[i]);
+            let playing = self.current == Some(i);
+            let c = cell_rect(i);
+            if playing {
+                f.draw(badge, c.x + 7.0, c.y + 13.0, 10.0, BLACK, true);
+            }
             let text = if searching && !tape.matched { Color { a: 0.3, ..INK } } else { INK };
-            let dim = if searching && !tape.matched { Color { a: 0.2, ..DIM } } else { DIM };
             let title = if album.mix == Some(0) { "BLANK TAPE".to_string() } else { album.album.to_uppercase() };
             f.draw(&f.fit(&title, 12.0, true, c.w), c.x, c.bottom() + 18.0, 12.0, if playing { self.accent } else { text }, true);
+        }
+
+        // Pass 5: regular captions (artist · year).
+        for &i in &visible {
+            let (album, tape) = (&self.albums[i], &self.tapes[i]);
+            let c = cell_rect(i);
+            let dim = if searching && !tape.matched { Color { a: 0.2, ..DIM } } else { DIM };
             let by = [album.artist.as_str(), album.year.as_str()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
             f.draw(&f.fit(&by.to_uppercase(), 10.0, false, c.w), c.x, c.bottom() + 33.0, 10.0, dim, false);
         }
@@ -4246,19 +4350,32 @@ impl App {
                 let rows = lay.list_rows();
                 let first = self.list_scroll as usize;
                 let hovered = self.track_at(lay, mouse_position().into());
-                for (k, t) in a.tracks.iter().enumerate().skip(first).take(rows) {
+                for (k, _) in a.tracks.iter().enumerate().skip(first).take(rows) {
                     let y = l.y + 50.0 + (k - first) as f32 * 22.0;
                     let row = Rect::new(l.x, y, l.w, 20.0);
-                    let color = if k == self.track {
+                    if k == self.track {
                         // The part still to play is greyed, so the row fills as the track plays.
                         round_rect(row, R_CHIP, Color::from_rgba(150, 150, 146, 255));
                         let played = row.w * self.progress();
                         if played > 0.5 {
                             round_rect(Rect::new(row.x, row.y, played.max(8.0), row.h), R_CHIP, self.accent);
                         }
-                        BLACK
                     } else if hovered == Some(k) {
                         round_rect(row, R_CHIP, Color::new(1.0, 1.0, 1.0, 0.06));
+                    }
+                }
+                if a.tracks.len() > rows {
+                    let track_h = l.h - 50.0;
+                    let bar_h = track_h * rows as f32 / a.tracks.len() as f32;
+                    let bar_y = l.y + 50.0 + track_h * self.list_scroll / a.tracks.len() as f32;
+                    draw_rectangle(l.right() - 1.0, bar_y, 2.0, bar_h, Color::new(1.0, 1.0, 1.0, 0.25));
+                }
+                for (k, t) in a.tracks.iter().enumerate().skip(first).take(rows) {
+                    let y = l.y + 50.0 + (k - first) as f32 * 22.0;
+                    let row = Rect::new(l.x, y, l.w, 20.0);
+                    let color = if k == self.track {
+                        BLACK
+                    } else if hovered == Some(k) {
                         INK
                     } else {
                         DIM
@@ -4274,12 +4391,6 @@ impl App {
                     let rw = f.width(&right, 11.0, false);
                     f.draw(&right, row.right() - 6.0 - rw, y + 14.0, 11.0, right_color, false);
                     f.draw(&f.fit(&t.title, 12.0, false, row.w - 60.0 - rw), row.x + 44.0, y + 14.0, 12.0, color, false);
-                }
-                if a.tracks.len() > rows {
-                    let track_h = l.h - 50.0;
-                    let bar_h = track_h * rows as f32 / a.tracks.len() as f32;
-                    let bar_y = l.y + 50.0 + track_h * self.list_scroll / a.tracks.len() as f32;
-                    draw_rectangle(l.right() - 1.0, bar_y, 2.0, bar_h, Color::new(1.0, 1.0, 1.0, 0.25));
                 }
                 self.draw_sleeve(l, i, a.tracks.len().min(rows));
             }
@@ -4328,17 +4439,31 @@ impl App {
                 round_rect_lines(row, R_CHIP, 1.0, Color::new(1.0, 1.0, 1.0, 0.35));
                 continue;
             }
-            let Some(i) = self.index_of(id) else { continue };
-            let Some(track) = self.albums[i].tracks.get(t) else { continue };
-            let color = if k == 0 {
+            if self.index_of(id).and_then(|i| self.albums[i].tracks.get(t)).is_none() {
+                continue;
+            }
+            if k == 0 {
                 round_rect(row, R_CHIP, Color::new(1.0, 1.0, 1.0, 0.1));
-                INK
             } else if hovered == Some(k) {
                 round_rect(row, R_CHIP, Color::new(1.0, 1.0, 1.0, 0.06));
-                INK
-            } else {
-                DIM
-            };
+            }
+        }
+        if n > rows {
+            let track_h = l.h - 50.0;
+            let bar_h = track_h * rows as f32 / n as f32;
+            let bar_y = l.y + 50.0 + track_h * self.queue_scroll / n as f32;
+            draw_rectangle(l.right() - 1.0, bar_y, 2.0, bar_h, Color::new(1.0, 1.0, 1.0, 0.25));
+        }
+        for (k, &q) in order.iter().enumerate().skip(first).take(rows) {
+            if dragging.is_some_and(|(from, _)| from == q) {
+                continue;
+            }
+            let (id, t) = self.queue[q];
+            let y = l.y + 50.0 + (k - first) as f32 * 22.0;
+            let row = Rect::new(l.x, y, l.w, 20.0);
+            let Some(i) = self.index_of(id) else { continue };
+            let Some(track) = self.albums[i].tracks.get(t) else { continue };
+            let color = if k == 0 || hovered == Some(k) { INK } else { DIM };
             f.draw(&format!("{:02}", k + 1), row.x + 6.0, y + 14.0, 12.0, color, false);
             let (right, right_color) = if hovered == Some(k) {
                 ("- REMOVE".to_string(), REC)
@@ -4360,12 +4485,6 @@ impl App {
                 round_rect(row, R_CHIP, INK);
                 f.draw(&f.fit(&track.title, 12.0, false, row.w - 20.0), row.x + 10.0, y + 14.0, 12.0, BLACK, false);
             }
-        }
-        if n > rows {
-            let track_h = l.h - 50.0;
-            let bar_h = track_h * rows as f32 / n as f32;
-            let bar_y = l.y + 50.0 + track_h * self.queue_scroll / n as f32;
-            draw_rectangle(l.right() - 1.0, bar_y, 2.0, bar_h, Color::new(1.0, 1.0, 1.0, 0.25));
         }
     }
 
@@ -4398,6 +4517,18 @@ impl App {
             t => self.draw_sleeve_turning(art, i, t),
         }
 
+        let summary_y = art.bottom() + 20.0;
+        for (row, line) in chips.iter().enumerate() {
+            let total: f32 = line.iter().map(|(_, w)| w).sum::<f32>() + (line.len() - 1) as f32 * GENRE_GAP;
+            let mut x = l.center().x - total / 2.0;
+            let y = summary_y + 10.0 + row as f32 * GENRE_ROW;
+            for (_, w) in line {
+                let chip = Rect::new(x, y, *w, GENRE_ROW - 4.0);
+                round_rect_lines(chip, R_CHIP, 1.0, Color::new(1.0, 1.0, 1.0, 0.3));
+                x += w + GENRE_GAP;
+            }
+        }
+
         let total: f32 = a.tracks.iter().filter_map(|t| t.duration).map(|d| d.as_secs_f32()).sum();
         let minutes = (total / 60.0).round() as u32;
         let mut parts = vec![format!("{} TRACK{}", a.tracks.len(), if a.tracks.len() == 1 { "" } else { "S" })];
@@ -4406,7 +4537,6 @@ impl App {
         }
         let text = self.fonts.fit(&parts.join("  ·  "), 10.0, false, l.w - 8.0);
         let w = self.fonts.width(&text, 10.0, false);
-        let summary_y = art.bottom() + 20.0;
         self.fonts.draw(&text, l.center().x - w / 2.0, summary_y, 10.0, DIM, false);
 
         for (row, line) in chips.iter().enumerate() {
@@ -4414,9 +4544,7 @@ impl App {
             let mut x = l.center().x - total / 2.0;
             let y = summary_y + 10.0 + row as f32 * GENRE_ROW;
             for (name, w) in line {
-                let chip = Rect::new(x, y, *w, GENRE_ROW - 4.0);
-                round_rect_lines(chip, R_CHIP, 1.0, Color::new(1.0, 1.0, 1.0, 0.3));
-                self.fonts.draw(name, chip.x + GENRE_PAD, chip.y + 12.0, 9.0, DIM, true);
+                self.fonts.draw(name, x + GENRE_PAD, y + 12.0, 9.0, DIM, true);
                 x += w + GENRE_GAP;
             }
         }
@@ -4925,14 +5053,16 @@ impl App {
         round_rect_lines(bay, 3.0, 1.0, Color::new(1.0, 1.0, 1.0, 0.16));
         round_rect_lines(s, R_BOX, 1.0, Color::new(1.0, 1.0, 1.0, 0.22));
         // Sticker on the door's corner while a hi-res track plays.
-        if let Some(i) = self.current
+        let hires_tag = if let Some(i) = self.current
             && self.albums[i].tracks.get(self.track).is_some_and(|t| t.hires)
         {
             let w = f.width("HI-RES", 9.0, true) + 12.0;
             let tag = Rect::new(s.right() - SP_S - w, s.y - 7.0, w, 14.0);
             round_rect(tag, R_CHIP, self.accent);
-            f.draw("HI-RES", tag.x + 6.0, tag.y + 10.5, 9.0, BLACK, true);
-        }
+            Some(tag)
+        } else {
+            None
+        };
 
         // Piano key caps. Play stays latched down while the tape runs; the
         // others spring back.
@@ -4985,6 +5115,26 @@ impl App {
             (Some(f), Some(d)) => f * d,
             _ => self.audio.position().as_secs_f32(),
         };
+        let p = lay.progress;
+        let mouse: Vec2 = mouse_position().into();
+        let over = self.seek_drag.is_some() || (dur.is_some() && lay.seek_bar().contains(mouse));
+        let bar_h = if over { 5.0 } else { p.h };
+        let bar_y = p.center().y - bar_h / 2.0;
+        draw_rectangle(p.x, bar_y, p.w, bar_h, Color::new(1.0, 1.0, 1.0, 0.18));
+        if let Some(dur) = dur {
+            let frac = (pos / dur).clamp(0.0, 1.0);
+            draw_rectangle(p.x, bar_y, p.w * frac, bar_h, self.accent);
+            draw_circle(p.x + p.w * frac, p.center().y, if over { 4.5 } else { 3.0 }, self.accent);
+            if over && self.seek_drag.is_none() {
+                // Where a click would land.
+                let at = ((mouse.x - p.x) / p.w).clamp(0.0, 1.0);
+                draw_rectangle(p.x + p.w * at - 0.5, p.center().y - 5.0, 1.0, 10.0, DIM);
+            }
+        }
+        if let Some(tag) = hires_tag {
+            f.draw("HI-RES", tag.x + 6.0, tag.y + 10.5, 9.0, BLACK, true);
+        }
+
         // The track number stays put; only the title moves.
         let (number, label) = match self.current {
             Some(i) => (format!("A{:02}", self.track + 1), self.albums[i].tracks[self.track].title.clone()),
@@ -5016,23 +5166,9 @@ impl App {
             gl.quad_gl.scissor(None);
         }
         // Elapsed on the left, time left on the right, around the progress bar.
-        let p = lay.progress;
-        let mouse: Vec2 = mouse_position().into();
-        let over = self.seek_drag.is_some() || (dur.is_some() && lay.seek_bar().contains(mouse));
-        let bar_h = if over { 5.0 } else { p.h };
-        let bar_y = p.center().y - bar_h / 2.0;
-        draw_rectangle(p.x, bar_y, p.w, bar_h, Color::new(1.0, 1.0, 1.0, 0.18));
         let time_y = p.y + 13.0;
         f.draw(&fmt_time(pos), p.x, time_y, 10.0, INK, false);
         if let Some(dur) = dur {
-            let frac = (pos / dur).clamp(0.0, 1.0);
-            draw_rectangle(p.x, bar_y, p.w * frac, bar_h, self.accent);
-            draw_circle(p.x + p.w * frac, p.center().y, if over { 4.5 } else { 3.0 }, self.accent);
-            if over && self.seek_drag.is_none() {
-                // Where a click would land.
-                let at = ((mouse.x - p.x) / p.w).clamp(0.0, 1.0);
-                draw_rectangle(p.x + p.w * at - 0.5, p.center().y - 5.0, 1.0, 10.0, DIM);
-            }
             let left = format!("-{}", fmt_time(dur - pos));
             f.draw(&left, p.right() - f.width(&left, 10.0, false), time_y, 10.0, DIM, false);
         }
@@ -5349,6 +5485,7 @@ async fn main() {
     // in each stage (CPU side, including the GL calls made there) every 240 frames.
     let profile = std::env::var("TAPEDECK_PROFILE").is_ok();
     let mut spent = [0.0f64; 8];
+    let mut slept = 0.0f32;
     loop {
         let frame_start = get_time();
         let mut clock = std::time::Instant::now();
@@ -5361,7 +5498,16 @@ async fn main() {
         app.receive_covers();
         app.input(&app.layout());
         lap(0);
-        app.tick(get_frame_time().min(0.1));
+        // When input wakes a throttled loop, `get_frame_time` includes the
+        // previous frame's sleep; strip it so the first scroll frame steps
+        // by one display frame instead of lurching ahead.
+        let raw_dt = get_frame_time();
+        let dt = if slept > 0.0 && app.frame_budget() == 0.0 {
+            (raw_dt - slept).clamp(1.0 / 240.0, 0.05)
+        } else {
+            raw_dt.min(0.1)
+        };
+        app.tick(dt);
         lap(1);
         app.render_faces();
         lap(2);
@@ -5404,9 +5550,13 @@ async fn main() {
         // display's full rate.
         let budget = app.frame_budget() as f64;
         let used = get_time() - frame_start;
-        if budget > used {
-            std::thread::sleep(std::time::Duration::from_secs_f64(budget - used));
-        }
+        slept = if budget > used {
+            let s = budget - used;
+            std::thread::sleep(std::time::Duration::from_secs_f64(s));
+            s as f32
+        } else {
+            0.0
+        };
         let swap = std::time::Instant::now();
         next_frame().await;
         if profile {
