@@ -2010,7 +2010,11 @@ impl App {
         if is_mouse_button_released(MouseButton::Left) {
             if let Some((_, _, moved)) = self.drag.take() {
                 if !moved {
-                    if let Some(i) = picked {
+                    // A click anywhere but the turned tape puts it back.
+                    if self.flipped.is_some_and(|f| !gridded && picked != Some(f)) {
+                        self.flipped = None;
+                        self.card_cursor = None;
+                    } else if let Some(i) = picked {
                         if gridded && self.current == Some(i) {
                             // The grid has no gap to return the tape to; its cover pauses instead.
                             self.toggle();
@@ -3060,7 +3064,7 @@ impl App {
             }
         }
 
-        if self.flipped.is_none() && self.view == View::Rail {
+        if self.view == View::Rail {
             if self.lyrics.is_some() {
                 self.draw_lyrics(lay);
             } else {
@@ -3758,35 +3762,33 @@ impl App {
     }
 
     fn input_lyrics(&mut self, lay: &Layout, mouse: Vec2, wheel: f32) -> bool {
-        if self.flipped.is_none() {
-            match &self.lyrics {
-                Some(Lyrics::Synced(lines)) => {
-                    if let Some(panel) = lay.synced_lyrics_panel().filter(|r| r.contains(mouse)) {
-                        let pos = self.audio.position().as_secs_f32() + 0.2;
-                        let focus = self.lyric_focus(lines, pos);
-                        if wheel != 0.0 {
-                            let start = self.lyric_preview.unwrap_or(focus as f32);
-                            self.lyric_preview = Some((start - wheel).clamp(0.0, (lines.len() - 1) as f32));
-                        } else if is_mouse_button_pressed(MouseButton::Left)
-                            && let Some((i, _)) = lyric_rows(panel, focus, lines.len()).find(|(_, row)| row.contains(mouse))
-                            && let Ok(time) = Duration::try_from_secs_f32(lines[i].at)
-                        {
-                            self.audio.seek(time);
-                            self.lyric_preview = None;
-                            self.save();
-                        }
-                        return true;
+        match &self.lyrics {
+            Some(Lyrics::Synced(lines)) => {
+                if let Some(panel) = lay.synced_lyrics_panel().filter(|r| r.contains(mouse)) {
+                    let pos = self.audio.position().as_secs_f32() + 0.2;
+                    let focus = self.lyric_focus(lines, pos);
+                    if wheel != 0.0 {
+                        let start = self.lyric_preview.unwrap_or(focus as f32);
+                        self.lyric_preview = Some((start - wheel).clamp(0.0, (lines.len() - 1) as f32));
+                    } else if is_mouse_button_pressed(MouseButton::Left)
+                        && let Some((i, _)) = lyric_rows(panel, focus, lines.len()).find(|(_, row)| row.contains(mouse))
+                        && let Ok(time) = Duration::try_from_secs_f32(lines[i].at)
+                    {
+                        self.audio.seek(time);
+                        self.lyric_preview = None;
+                        self.save();
                     }
+                    return true;
                 }
-                Some(Lyrics::Plain(lines)) => {
-                    let panel = lay.plain_lyrics_panel();
-                    if panel.h >= 60.0 && panel.w >= 120.0 && panel.contains(mouse) {
-                        self.lyrics_scroll = (self.lyrics_scroll - wheel).clamp(0.0, (lines.len() - 1) as f32);
-                        return true;
-                    }
-                }
-                None => {}
             }
+            Some(Lyrics::Plain(lines)) => {
+                let panel = lay.plain_lyrics_panel();
+                if panel.h >= 60.0 && panel.w >= 120.0 && panel.contains(mouse) {
+                    self.lyrics_scroll = (self.lyrics_scroll - wheel).clamp(0.0, (lines.len() - 1) as f32);
+                    return true;
+                }
+            }
+            None => {}
         }
         self.lyric_preview = None;
         false
@@ -3899,7 +3901,10 @@ impl App {
         if panel.w < 120.0 || panel.h < 60.0 {
             return;
         }
-        round_rect(panel, R_BOX, Color::new(0.035, 0.035, 0.035, 0.97));
+        // Transparent like the synced lyrics; the box shows only under the mouse.
+        if panel.contains(mouse_position().into()) {
+            round_rect(panel, R_BOX, Color::new(0.035, 0.035, 0.035, 0.97));
+        }
         let x = panel.x + 12.0;
         let width = panel.w - 24.0;
         let f = &self.fonts;
