@@ -64,48 +64,27 @@ impl std::hash::Hasher for Fx {
 
 type FxBuild = std::hash::BuildHasherDefault<Fx>;
 
-/// A loaded font and the characters it has glyphs for.
+/// A parsed font and the characters it has glyphs for.
 struct Face {
-    font: Font,
+    font: fontdue::Font,
     path: String,
     chars: HashSet<char, FxBuild>,
 }
 
 impl Face {
-    fn load(path: &str) -> Option<Rc<Face>> {
+    /// Reads and parses a font file. Big fonts (the CJK one has ~45k glyphs)
+    /// take a while, so this runs off the main thread where it can.
+    fn parse(path: &str) -> Option<Face> {
         let bytes = std::fs::read(path).ok()?;
-        let parsed = ttf_parser::Face::parse(&bytes, 0).ok()?;
-        let mut chars = HashSet::default();
-        for table in parsed.tables().cmap.iter().flat_map(|cmap| cmap.subtables).filter(|t| t.is_unicode()) {
-            table.codepoints(|cp| chars.extend(char::from_u32(cp)));
-        }
-        let font = load_ttf_font_from_bytes(&bytes).ok()?;
-        Some(Rc::new(Face { font, path: path.to_string(), chars }))
+        let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).ok()?;
+        let chars = font.chars().keys().copied().collect();
+        Some(Face { font, path: path.to_string(), chars })
     }
 
     /// Whitespace and control characters draw as blanks in any font.
     fn has(&self, c: char) -> bool {
         c.is_whitespace() || c.is_control() || self.chars.contains(&c)
     }
-}
-
-pub struct Fonts {
-    regular: Option<Rc<Face>>,
-    bold: Option<Rc<Face>>,
-    cjk: Option<Rc<Face>>,
-    /// Fonts found on the system for characters the ones above lack.
-    fallbacks: std::cell::RefCell<Vec<Rc<Face>>>,
-    /// Characters already looked up on the system, found or not.
-    searched: std::cell::RefCell<HashSet<char, FxBuild>>,
-    /// Glyphs known to be in a font's atlas, by font address, character and size.
-    cached: std::cell::RefCell<std::collections::HashSet<(usize, char, u16), FxBuild>>,
-    /// Measured widths by a hash of text, size and weight: the same labels
-    /// are measured every frame, and measuring walks every glyph.
-    widths: std::cell::RefCell<std::collections::HashMap<u64, f32, FxBuild>>,
-    /// Truncated strings from `fit`, cached by text, size, weight and max width.
-    fitted: std::cell::RefCell<std::collections::HashMap<u64, String, FxBuild>>,
-    /// A clear pixel drawn to move texture slot 0 off the font atlases; see `prepare`.
-    spare: Texture2D,
 }
 
 /// The file of the system font fontconfig picks for `pattern`.
@@ -115,78 +94,215 @@ fn system_font_path(pattern: &str) -> Option<String> {
     Some(path.trim().to_string()).filter(|p| !p.is_empty())
 }
 
-fn system_font(pattern: &str) -> Option<Rc<Face>> {
-    Face::load(&system_font_path(pattern)?)
+/// The first of `patterns` that resolves to a font that parses.
+fn system_font(patterns: &[&str]) -> Option<Face> {
+    patterns.iter().find_map(|p| Face::parse(&system_font_path(p)?))
+}
+
+type Loading = std::thread::JoinHandle<Option<Face>>;
+
+/// The interface fonts being looked up and parsed: regular, bold and CJK.
+static PRELOAD: std::sync::Mutex<Option<[Loading; 3]>> = std::sync::Mutex::new(None);
+
+/// Starts finding and parsing the interface fonts, each on its own thread,
+/// so the work overlaps the window opening and the library scan. Later
+/// calls do nothing; `Fonts::load` picks up the results.
+pub fn preload_fonts() {
+    let mut preload = PRELOAD.lock().unwrap_or_else(|e| e.into_inner());
+    if preload.is_some() {
+        return;
+    }
+    let spawn = |patterns: &'static [&'static str]| std::thread::spawn(move || system_font(patterns));
+    *preload = Some([
+        spawn(&["JetBrains Mono:style=Regular", "monospace"]),
+        spawn(&["JetBrains Mono:style=Bold", "monospace:bold"]),
+        // Many titles are Japanese or Korean.
+        spawn(&["Noto Sans CJK JP:style=Bold"]),
+    ]);
+}
+
+/// Where a rasterized glyph sits in the atlas, and how to place it.
+#[derive(Clone, Copy)]
+struct Glyph {
+    rect: Rect,
+    offset: Vec2,
+    advance: f32,
+}
+
+/// One texture holding every rasterized glyph, of every font and size.
+///
+/// Glyphs never move once placed, and a new one uploads only its own
+/// pixels. (Macroquad's own font atlas uploads the whole texture for each
+/// new glyph and repacks everything when it grows, which stalled frames for
+/// tens of milliseconds whenever a title showed new characters.) When the
+/// atlas fills up it gets taller: the glyphs keep their places in a new
+/// texture, and the old texture is kept, not deleted, so draws already
+/// queued with it still find their pixels and its GL name is never reused
+/// (miniquad's binding cache would take a reused name as already bound).
+struct Atlas {
+    texture: Texture2D,
+    pixels: Vec<u8>,
+    height: u16,
+    /// Packing cursor: the free spot in the current row and that row's height.
+    x: u16,
+    y: u16,
+    row: u16,
+    retired: Vec<Texture2D>,
+}
+
+const ATLAS_W: u16 = 1024;
+const ATLAS_MAX_H: u16 = 8192;
+/// Clear pixels around each glyph, so linear filtering does not bleed.
+const ATLAS_GAP: u16 = 2;
+
+impl Atlas {
+    fn new() -> Self {
+        let height = 512;
+        let pixels = vec![0; ATLAS_W as usize * height as usize * 4];
+        Self { texture: Self::upload(&pixels, height), pixels, height, x: 0, y: 0, row: 0, retired: Vec::new() }
+    }
+
+    fn upload(pixels: &[u8], height: u16) -> Texture2D {
+        let texture = Texture2D::from_rgba8(ATLAS_W, height, pixels);
+        texture.set_filter(FilterMode::Linear);
+        texture
+    }
+
+    /// Places a `w` by `h` glyph of coverage values; None when it is full.
+    fn insert(&mut self, w: u16, h: u16, coverage: &[u8]) -> Option<Rect> {
+        if w == 0 || h == 0 {
+            return Some(Rect::default());
+        }
+        if w + 2 * ATLAS_GAP > ATLAS_W {
+            return None;
+        }
+        if self.x + w + 2 * ATLAS_GAP > ATLAS_W {
+            self.x = 0;
+            self.y += self.row + ATLAS_GAP;
+            self.row = 0;
+        }
+        while self.y + h + 2 * ATLAS_GAP > self.height {
+            if self.height >= ATLAS_MAX_H {
+                return None;
+            }
+            self.height *= 2;
+            self.pixels.resize(ATLAS_W as usize * self.height as usize * 4, 0);
+            let grown = Self::upload(&self.pixels, self.height);
+            self.retired.push(std::mem::replace(&mut self.texture, grown));
+        }
+        let (x, y) = (self.x + ATLAS_GAP, self.y + ATLAS_GAP);
+        let bytes: Vec<u8> = coverage.iter().flat_map(|&a| [255, 255, 255, a]).collect();
+        let row_bytes = w as usize * 4;
+        for (j, row) in bytes.chunks_exact(row_bytes).enumerate() {
+            let at = ((y as usize + j) * ATLAS_W as usize + x as usize) * 4;
+            self.pixels[at..at + row_bytes].copy_from_slice(row);
+        }
+        self.texture.update_part(&Image { bytes, width: w, height: h }, x as i32, y as i32, w as i32, h as i32);
+        self.x += w + ATLAS_GAP;
+        self.row = self.row.max(h + ATLAS_GAP);
+        Some(Rect::new(x as f32, y as f32, w as f32, h as f32))
+    }
+
+    /// Starts over empty, for when it cannot grow any more.
+    fn clear(&mut self) {
+        let fresh = Self::new();
+        let old = std::mem::replace(self, fresh);
+        self.retired = old.retired;
+        self.retired.push(old.texture);
+    }
+}
+
+pub struct Fonts {
+    regular: Option<Rc<Face>>,
+    bold: Option<Rc<Face>>,
+    /// Only needed for titles in Japanese or Korean, so it may still be
+    /// parsing in the background when the first frames draw.
+    cjk: std::cell::OnceCell<Option<Rc<Face>>>,
+    cjk_loading: std::cell::RefCell<Option<Loading>>,
+    /// Fonts found on the system for characters the ones above lack.
+    fallbacks: std::cell::RefCell<Vec<Rc<Face>>>,
+    /// Characters already looked up on the system, found or not.
+    searched: std::cell::RefCell<HashSet<char, FxBuild>>,
+    /// Rasterized glyphs by font address, character and size.
+    glyphs: std::cell::RefCell<std::collections::HashMap<(usize, char, u16), Glyph, FxBuild>>,
+    atlas: std::cell::RefCell<Atlas>,
+    /// Measured widths by a hash of text, size and weight: the same labels
+    /// are measured every frame, and measuring walks every glyph.
+    widths: std::cell::RefCell<std::collections::HashMap<u64, f32, FxBuild>>,
+    /// Truncated strings from `fit`, cached by text, size, weight and max width.
+    fitted: std::cell::RefCell<std::collections::HashMap<u64, String, FxBuild>>,
+}
+
+fn face_id(face: &Rc<Face>) -> usize {
+    Rc::as_ptr(face) as usize
+}
+
+/// Text size in pixels for the font, as macroquad sizes it.
+fn pixel_size(size: u16) -> (u16, f32) {
+    let dpi = miniquad::window::dpi_scale();
+    ((size as f32 * dpi).ceil() as u16, dpi)
 }
 
 impl Fonts {
+    /// Takes the fonts `preload_fonts` started on (starting it if needed),
+    /// waiting for the regular and bold ones.
     pub fn load() -> Self {
-        let regular = system_font("JetBrains Mono:style=Regular").or_else(|| system_font("monospace"));
-        let bold = system_font("JetBrains Mono:style=Bold").or_else(|| system_font("monospace:bold"));
-        // Many titles are Japanese or Korean.
-        let cjk = system_font("Noto Sans CJK JP:style=Bold");
-        let mut cached = HashSet::default();
-        let mut warm: Vec<char> = (' '..='~').collect();
-        warm.extend(['·', '…', '←', '→', '↑', '↓', 'µ', '×']);
-        for (face, sizes) in [
-            (&regular, &[8u16, 10, 11, 12, 13, 14, 15, 16][..]),
-            (&bold, &[9u16, 10, 11, 12, 13, 15, 16, 17, 18, 20, 21, 23, 24, 25, 32][..]),
-        ] {
-            if let Some(f) = face {
-                let id = &f.font as *const Font as usize;
-                let glyphs: Vec<char> = warm.iter().copied().filter(|&c| f.has(c)).collect();
-                for &size in sizes {
-                    f.font.populate_font_cache(&glyphs, size);
-                    cached.extend(glyphs.iter().map(|&c| (id, c, size)));
-                }
-            }
-        }
+        preload_fonts();
+        let loading = PRELOAD.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let [regular, bold, cjk] = match loading {
+            Some([r, b, c]) => [Some(r), Some(b), Some(c)],
+            None => [None, None, None],
+        };
+        let join = |h: Option<Loading>| h.and_then(|h| h.join().ok().flatten()).map(Rc::new);
         Self {
-            regular,
-            bold,
-            cjk,
+            regular: join(regular),
+            bold: join(bold),
+            cjk: Default::default(),
+            cjk_loading: std::cell::RefCell::new(cjk),
             fallbacks: Default::default(),
             searched: Default::default(),
-            cached: std::cell::RefCell::new(cached),
+            glyphs: Default::default(),
+            atlas: std::cell::RefCell::new(Atlas::new()),
             widths: Default::default(),
             fitted: Default::default(),
-            spare: Texture2D::from_rgba8(1, 1, &[0; 4]),
         }
     }
 
-    /// Puts any glyph of `text` that is not cached yet into the font's atlas,
-    /// after sending what is queued to the GPU. A new glyph can make the
-    /// atlas grow, which repacks every glyph and replaces its texture: text
-    /// still queued from earlier in the frame would then sample the wrong
-    /// places. Popping a pushed camera state submits the queue and leaves the
-    /// camera as it was.
-    ///
-    /// The grown atlas also gets a new GL texture, and miniquad's binding
-    /// cache does not forget a deleted one: if the old atlas was the last
-    /// texture drawn, the driver hands its name to the new one, the cache
-    /// takes it as already bound, and the glyph upload lands nowhere. That
-    /// font then draws as solid blocks until its atlas grows again. Drawing
-    /// the spare pixel last before submitting leaves slot 0 on a texture
-    /// that is never deleted.
-    fn prepare(&self, font: Option<&Font>, text: &str, size: u16) {
-        let Some(font) = font else { return };
-        let id = font as *const Font as usize;
-        let mut cached = self.cached.borrow_mut();
-        let missing: Vec<char> = text.chars().filter(|&c| cached.insert((id, c, size))).collect();
-        if missing.is_empty() {
-            return;
+    /// The CJK font, waiting for it to finish parsing the first time.
+    fn cjk(&self) -> Option<&Rc<Face>> {
+        self.cjk
+            .get_or_init(|| self.cjk_loading.borrow_mut().take().and_then(|h| h.join().ok().flatten()).map(Rc::new))
+            .as_ref()
+    }
+
+    /// The glyph for `c` at pixel size `px`, rasterizing it the first time.
+    fn glyph(&self, face: &Rc<Face>, c: char, px: u16) -> Glyph {
+        let key = (face_id(face), c, px);
+        if let Some(&g) = self.glyphs.borrow().get(&key) {
+            return g;
         }
-        draw_texture_ex(&self.spare, 0.0, 0.0, BLANK, DrawTextureParams { dest_size: Some(vec2(1.0, 1.0)), ..Default::default() });
-        push_camera_state();
-        pop_camera_state();
-        font.populate_font_cache(&missing, size);
+        let (m, coverage) = face.font.rasterize(c, px as f32);
+        let mut atlas = self.atlas.borrow_mut();
+        let rect = atlas.insert(m.width as u16, m.height as u16, &coverage).or_else(|| {
+            // Full: start a new atlas; glyphs are rasterized again as drawn.
+            atlas.clear();
+            self.glyphs.borrow_mut().clear();
+            atlas.insert(m.width as u16, m.height as u16, &coverage)
+        });
+        let g = Glyph {
+            rect: rect.unwrap_or_default(),
+            offset: vec2(m.xmin as f32, m.ymin as f32),
+            advance: m.advance_width,
+        };
+        self.glyphs.borrow_mut().insert(key, g);
+        g
     }
 
     fn pick(&self, text: &str, bold: bool) -> Option<&Rc<Face>> {
         // Latin and general punctuation stay in the mono font.
         let wide = |c: char| c as u32 > 0x24F && !(0x2000..=0x206F).contains(&(c as u32));
-        if text.chars().any(wide) && self.cjk.is_some() {
-            return self.cjk.as_ref();
+        if text.chars().any(wide) && let Some(cjk) = self.cjk() {
+            return Some(cjk);
         }
         if bold { self.bold.as_ref() } else { self.regular.as_ref() }
     }
@@ -198,7 +314,7 @@ impl Fonts {
             return primary.cloned();
         }
         let mono = if bold { &self.bold } else { &self.regular };
-        let loaded = [mono, &self.cjk].into_iter().flatten().cloned();
+        let loaded = mono.iter().chain(self.cjk()).cloned();
         let found = loaded.chain(self.fallbacks.borrow().iter().cloned()).find(|f| f.has(c));
         if found.is_some() || !self.searched.borrow_mut().insert(c) {
             return found.or_else(|| primary.cloned());
@@ -207,7 +323,7 @@ impl Fonts {
         let path = system_font_path(&format!(":charset={:x}{weight}", c as u32));
         let mut fallbacks = self.fallbacks.borrow_mut();
         let face = match path {
-            Some(path) if !fallbacks.iter().any(|f| f.path == path) => Face::load(&path),
+            Some(path) if !fallbacks.iter().any(|f| f.path == path) => Face::parse(&path).map(Rc::new),
             _ => None,
         };
         match face.filter(|f| f.has(c)) {
@@ -246,22 +362,58 @@ impl Fonts {
         runs
     }
 
-    /// Puts every glyph of `text` into its font's atlas; see `prepare`.
+    /// Rasterizes every glyph of `text` ahead of drawing it.
     pub fn prepare_text(&self, text: &str, size: u16, bold: bool) {
+        let (px, _) = pixel_size(size);
         for (face, run) in self.runs(text, bold) {
-            self.prepare(face.as_ref().map(|f| &f.font), run, size);
+            if let Some(face) = &face {
+                for c in run.chars() {
+                    self.glyph(face, c, px);
+                }
+            }
         }
     }
 
+    /// Width of a run in one font, as macroquad measures it: advances
+    /// only, no kerning. Measuring does not rasterize.
+    fn run_width(face: Option<&Rc<Face>>, run: &str, size: u16, scale: f32) -> f32 {
+        let Some(face) = face else {
+            return measure_text(run, None, size, scale).width;
+        };
+        let (px, dpi) = pixel_size(size);
+        run.chars().map(|c| face.font.metrics(c, px as f32).advance_width * scale).sum::<f32>() / dpi
+    }
+
     /// Draws `text` with its baseline at `y`, each run in its own font,
-    /// at `scale` times `size`.
+    /// at `scale` times `size`. Glyphs are placed as macroquad's
+    /// `draw_text_ex` places them.
     pub fn draw_scaled(&self, text: &str, x: f32, y: f32, size: u16, scale: f32, color: Color, bold: bool) {
         let mut x = x;
         for (face, run) in self.runs(text, bold) {
-            let font = face.as_ref().map(|f| &f.font);
-            self.prepare(font, run, size);
-            draw_text_ex(run, x, y, TextParams { font, font_size: size, font_scale: scale, color, ..Default::default() });
-            x += measure_text(run, font, size, scale).width;
+            let Some(face) = &face else {
+                // No system font at all: macroquad's built-in one.
+                draw_text_ex(run, x, y, TextParams { font: None, font_size: size, font_scale: scale, color, ..Default::default() });
+                x += measure_text(run, None, size, scale).width;
+                continue;
+            };
+            let (px, dpi) = pixel_size(size);
+            let mut pen = 0.0;
+            let mut last = None;
+            for c in run.chars() {
+                let g = self.glyph(face, c, px);
+                let kern = last.and_then(|l| face.font.horizontal_kern(l, c, px as f32)).unwrap_or(0.0);
+                last = Some(c);
+                if g.rect.w > 0.0 {
+                    let (w, h) = (g.rect.w * scale, g.rect.h * scale);
+                    let dx = (g.offset.x * scale + pen + kern) / dpi + x;
+                    let dy = (-h - g.offset.y * scale) / dpi + y;
+                    let atlas = self.atlas.borrow();
+                    let params = DrawTextureParams { dest_size: Some(vec2(w / dpi, h / dpi)), source: Some(g.rect), ..Default::default() };
+                    draw_texture_ex(&atlas.texture, dx, dy, color, params);
+                }
+                pen += g.advance * scale + kern;
+            }
+            x += Self::run_width(Some(face), run, size, scale);
         }
     }
 
@@ -273,15 +425,7 @@ impl Fonts {
         if let Some(&w) = self.widths.borrow().get(&key) {
             return w;
         }
-        let w = self
-            .runs(text, bold)
-            .into_iter()
-            .map(|(face, run)| {
-                let font = face.as_ref().map(|f| &f.font);
-                self.prepare(font, run, size as u16);
-                measure_text(run, font, size as u16, 1.0).width
-            })
-            .sum();
+        let w = self.runs(text, bold).iter().map(|(face, run)| Self::run_width(face.as_ref(), run, size as u16, 1.0)).sum();
         let mut widths = self.widths.borrow_mut();
         // Scrolling titles and search results keep adding new strings.
         if widths.len() > 20_000 {

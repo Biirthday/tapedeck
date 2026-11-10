@@ -314,6 +314,9 @@ fn corner_mask(corner: Vec2, center: Vec2, rad: f32, start: f32, color: Color) {
 }
 
 fn window_conf() -> Conf {
+    // Runs before the window opens: start on the fonts now, so parsing them
+    // overlaps opening the window and scanning the library.
+    gfx::preload_fonts();
     let fullscreen = load_saved().fullscreen;
     Conf {
         fullscreen,
